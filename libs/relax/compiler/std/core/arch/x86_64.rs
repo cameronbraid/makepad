@@ -39,6 +39,16 @@ pub fn __get_cpuid_max(leaf: u32) -> (u32, u32) {
 
 pub const _XCR_XFEATURE_ENABLED_MASK: u32 = 0;
 
+#[inline]
+pub const unsafe fn _bswap(a: i32) -> i32 {
+    a.swap_bytes()
+}
+
+#[inline]
+pub const unsafe fn _bswap64(a: i64) -> i64 {
+    a.swap_bytes()
+}
+
 /// Read an extended control register. The caller must ensure XSAVE/OSXSAVE
 /// support and that `xcr` names an index supported by the processor.
 #[inline]
@@ -779,6 +789,19 @@ pub unsafe fn _mm256_slli_epi16<const IMM8: i32>(a: __m256i) -> __m256i {
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 pub unsafe fn _mm256_slli_epi32<const IMM8: i32>(a: __m256i) -> __m256i {
     i_join(_mm_slli_epi32::<IMM8>(i_lo(&a)), _mm_slli_epi32::<IMM8>(i_hi(&a)))
+}
+// Byte shifts operate independently in each 128-bit half, with zero fill.
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_slli_si256<const IMM8: i32>(a: __m256i) -> __m256i {
+    const { assert!(IMM8 >= 0 && IMM8 < 256) };
+    i_join(_mm_slli_si128::<IMM8>(i_lo(&a)), _mm_slli_si128::<IMM8>(i_hi(&a)))
+}
+#[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "avx2"))]
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_srli_si256<const IMM8: i32>(a: __m256i) -> __m256i {
+    const { assert!(IMM8 >= 0 && IMM8 < 256) };
+    i_join(_mm_srli_si128::<IMM8>(i_lo(&a)), _mm_srli_si128::<IMM8>(i_hi(&a)))
 }
 // rustc library/stdarch/crates/core_arch/src/x86/avx2.rs: _mm256_slli_epi64 / _mm256_srli_epi64.
 // Counts >= 64 zero every lane, rather than wrapping the count modulo 64.
