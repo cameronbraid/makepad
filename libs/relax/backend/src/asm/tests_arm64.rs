@@ -649,7 +649,7 @@ ldr q0, #-16
 prfm pldl1keep, [x0]
 prfm pldl1strm, [x0, #8]
 prfm pstl3strm, [x0, #32760]
-prfm plil2keep, [x0, #-8]
+prfum plil2keep, [x0, #-8]
 prfm pldl1keep, [x0, x1]
 prfm pldl1keep, [x0, x1, lsl #3]
 prfm #5, [x0]
