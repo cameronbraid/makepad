@@ -11,7 +11,7 @@ use crate::{
 use std::sync::Arc;
 
 // Demand certificates belong to the graph; crate records keep only their own selection.
-pub const VERSION: u32 = 26;
+pub const VERSION: u32 = 27;
 
 pub(crate) mod strings;
 
@@ -211,7 +211,7 @@ impl Codec for MacroDef {
     }
 }
 fields!(UseItem, module, path, bind, is_pub);
-fields!(ModItem, pos, end, macro_use);
+fields!(ModItem, pos, end, macro_use, is_pub);
 fields!(LazyCtx, krate, path, module_path, mods, s2_fmt);
 /// Option<Box<LazyCtx>>'s encoding
 impl Codec for crate::parser::FileLazy {

@@ -193,7 +193,7 @@ macro_rules! fields {
 }
 pub(crate) use fields;
 fields!(crate::macros::UseItem, module, path, bind, is_pub);
-fields!(crate::macros::ModItem, pos, end, macro_use);
+fields!(crate::macros::ModItem, pos, end, macro_use, is_pub);
 
 impl<K: Pack + Ord + std::hash::Hash, V: Pack> Pack for HashMap<K, V> {
     fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) {

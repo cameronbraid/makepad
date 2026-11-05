@@ -160,6 +160,8 @@ pub struct ModItem {
     pub pos: u32,
     pub end: u32,
     pub macro_use: bool,
+    /// Unrestricted `pub`; private/restricted modules are not imported across crates.
+    pub is_pub: bool,
 }
 
 #[derive(Default)]
@@ -1067,6 +1069,14 @@ impl<'a> Res<'a> {
 /// The module `path` names from module `m` of crate `k`; `type_in` gives the module a name
 /// denotes in a module (the finished scopes, or the ones being computed).
 fn resolve_path<'b, S: AsRef<str>>(r: &Res<'b>, k: &'b str, m: &'b str, path: &'b [S], type_in: &dyn Fn(&'b str, &'b str, &'b str) -> Option<(&'b str, &'b str)>) -> Option<(&'b str, &'b str)> {
+    // A macro-only import can share a name with a dependency's private module.
+    // That module must not create a type binding that shadows the extern prelude.
+    let visible_type = |kk, mm, n| {
+        let target = type_in(kk, mm, n)?;
+        if target.0 != k && r.table.crates.get(target.0).and_then(|c| c.items.get(target.1))
+            .is_some_and(|item| !item.is_pub) { return None; }
+        Some(target)
+    };
     let s0 = path.first()?.as_ref();
     let (mut cur, rest) = if s0 == "crate" {
         (r.crate_root(k), &path[1..])
@@ -1086,7 +1096,7 @@ fn resolve_path<'b, S: AsRef<str>>(r: &Res<'b>, k: &'b str, m: &'b str, path: &'
             },
         }
     } else {
-        let first = match type_in(k, m, s0) {
+        let first = match visible_type(k, m, s0) {
             Some(x) => x,
             None => r.extern_crate(k, s0)?,
         };
@@ -1096,7 +1106,7 @@ fn resolve_path<'b, S: AsRef<str>>(r: &Res<'b>, k: &'b str, m: &'b str, path: &'
         cur = match s.as_ref() {
             "super" => (cur.0, cur.1.rsplit_once("::").map(|x| x.0)?),
             "self" => cur,
-            _ => type_in(cur.0, cur.1, s.as_ref())?,
+            _ => visible_type(cur.0, cur.1, s.as_ref())?,
         };
     }
     Some(cur)
@@ -3409,7 +3419,7 @@ mod replay_tests {
     #[test]
     fn textual_scope_is_lexical_and_leaves_modules_only_through_macro_use() {
         let mut cm = CrateMods { root: "c".into(), ..Default::default() };
-        let item = |pos, end, macro_use| ModItem { pos, end, macro_use };
+        let item = |pos, end, macro_use| ModItem { pos, end, macro_use, is_pub: false };
         // c: macro a (pos 10); mod b { macro b1 (pos 20) } at 30..40 ; #[macro_use] mod m { macro m1 } at 50..60; mod x; at 70..71
         // c::b::inner, c::m::sub (with its own #[macro_use] mod deep { macro d1 } at 15..25)
         for (m, it) in [("c::b", item(30, 40, false)), ("c::m", item(50, 60, true)), ("c::x", item(70, 71, false)),
