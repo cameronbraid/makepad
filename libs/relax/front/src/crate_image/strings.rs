@@ -193,6 +193,7 @@ macro_rules! fields {
 }
 pub(crate) use fields;
 fields!(crate::macros::UseItem, module, path, bind, is_pub);
+fields!(crate::macros::ModItem, pos, end, macro_use);
 
 impl<K: Pack + Ord + std::hash::Hash, V: Pack> Pack for HashMap<K, V> {
     fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) {
@@ -216,15 +217,19 @@ impl<T: Pack + Ord + std::hash::Hash> Pack for crate::fxhash::HashSet<T> {
 impl Pack for crate::macros::CrateMods {
     fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) {
         self.root.pack(w, s); self.src.pack(w, s); self.mods.pack(w, s);
-        self.uses.pack(w, s); self.externs.pack(w, s); self.renames.pack(w, s);
+        // Textual macro scope depends on declaration positions and #[macro_use].
+        self.items.pack(w, s); self.uses.pack(w, s); self.externs.pack(w, s); self.renames.pack(w, s);
+        self.recursion_limit.pack(w, s);
     }
     fn unpack(r: &mut Decode<'_>, s: &[String]) -> Option<Self> {
         Some(Self { root: Pack::unpack(r, s)?, src: Pack::unpack(r, s)?, mods: Pack::unpack(r, s)?,
-            uses: Pack::unpack(r, s)?, externs: Pack::unpack(r, s)?, renames: Pack::unpack(r, s)?, ..Self::default() })
+            items: Pack::unpack(r, s)?, uses: Pack::unpack(r, s)?, externs: Pack::unpack(r, s)?, renames: Pack::unpack(r, s)?,
+            recursion_limit: Pack::unpack(r, s)?, ..Self::default() })
     }
     fn plain_size(&self) -> usize {
         self.root.plain_size() + self.src.plain_size() + self.mods.plain_size()
-            + self.uses.plain_size() + self.externs.plain_size() + self.renames.plain_size()
+            + self.items.plain_size() + self.uses.plain_size() + self.externs.plain_size() + self.renames.plain_size()
+            + self.recursion_limit.plain_size()
     }
 }
 
