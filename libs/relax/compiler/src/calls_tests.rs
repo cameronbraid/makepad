@@ -72,7 +72,11 @@ fn patched_callee_while_callers_run() {
     std::fs::write(dir.join("app/Cargo.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
     std::fs::write(dir.join("app/src/lib.rs"), APP).unwrap();
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
-    let session = Arc::new(crate::Session::default());
+    let mut session = crate::Session::default();
+    // This test publishes old/new code targets itself. Tier counters can put
+    // a counting stub in the slot instead, until enough calls reach it.
+    session.options.tier1 = false;
+    let session = Arc::new(session);
     let (prog, core, app_crate) = crate::load_with_std(&session, &app, "calls_app", false).unwrap();
     let def = |name: &str| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = crate::program::DefId(i as u32);
