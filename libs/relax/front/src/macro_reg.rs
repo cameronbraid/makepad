@@ -344,6 +344,16 @@ pub fn current_call_krate() -> String {
     CALL_KRATE.with(|c| c.borrow().clone())
 }
 
+/// Cargo's already-resolved host build outputs, independent of the application's table.
+pub fn host_env_registered(krate: &str, key: &str) -> Option<String> {
+    REG.with(|r| {
+        let r = r.borrow();
+        let reg = r.as_ref()?;
+        reg.units.iter().find(|u| u.name == krate)?
+            .env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    })
+}
+
 pub fn call_krate_env(key: &str) -> Option<String> {
     let krate = current_call_krate();
     if krate.is_empty() {

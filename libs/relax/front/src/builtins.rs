@@ -1246,7 +1246,9 @@ fn expand_pm_ts(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: usi
 fn env_value(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
     let v = env_value_inner(ctx, name);
     // a macro input outside the source: part of the crate's cache validity (stable.rs ledger)
-    crate::sip::note_late_input(ctx.map_or("", |c| c.krate.as_str()), crate::sip::LATE_ENV, name, v.as_deref().map(|x| x.as_bytes()));
+    let host = ctx.is_some_and(|c| c.cfg.set.iter().any(|s| s == crate::crates::MACRO_HOST_CFG));
+    let kind = if host { crate::sip::LATE_HOST_ENV } else { crate::sip::LATE_ENV };
+    crate::sip::note_late_input(ctx.map_or("", |c| c.krate.as_str()), kind, name, v.as_deref().map(|x| x.as_bytes()));
     v
 }
 
@@ -1254,7 +1256,8 @@ fn env_value_inner(ctx: Option<&FileCtx>, name: &str) -> Option<String> {
     // cargo's per-crate environment as `makepad run` registered it (unitgraph.rs), then what Relax
     // knows from the crate's Cargo.toml, then the process environment
     if let Some(c) = ctx {
-        if let Some(v) = crate::crates::crate_env_registered(&c.krate, name) {
+        let host = c.cfg.set.iter().any(|s| s == crate::crates::MACRO_HOST_CFG);
+        if let Some(v) = crate::crates::crate_env_registered_in(&c.krate, name, host) {
             return Some(v);
         }
         match name {

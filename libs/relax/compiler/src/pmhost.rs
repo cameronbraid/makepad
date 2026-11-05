@@ -517,7 +517,11 @@ fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macr
     // macros run on this machine: its pointer width, whatever the program's target
     prog.ptr_bytes = 8;
     // macros run here: the machine's cfg, never MAKEPAD_RUN_CHECK_TARGET's
-    let host = |f: &[String]| crate::cfg::CfgSet::machine(sess, f);
+    let host = |f: &[String]| {
+        let mut cfg = crate::cfg::CfgSet::machine(sess, f);
+        cfg.set.push(crate::crates::MACRO_HOST_CFG.to_string());
+        cfg
+    };
     let core = prog.load_crate_deferred("core", &format!("{}/core/lib.rs", std_dir), 2021, host(&[]), Vec::new())?;
     let mut std_deps = vec![(prog.syms.intern("core"), core)];
     let alloc_root = format!("{}/alloc/lib.rs", std_dir);
@@ -555,7 +559,6 @@ fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macr
             for c in &u.cfgs {
                 cs.set.push(c.replace('"', ""));
             }
-            crate::crates::set_crate_env(&u.name, u.env.clone());
             struct AllowBoot(bool);
             impl Drop for AllowBoot {
                 fn drop(&mut self) {

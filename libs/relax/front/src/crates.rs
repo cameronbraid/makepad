@@ -530,6 +530,9 @@ pub fn join_path(base: &str, p: &str) -> String {
     std::path::Path::new(base).join(p).to_string_lossy().into_owned()
 }
 
+/// Internal host context, retained in cfg snapshots and parse/cache identities.
+pub const MACRO_HOST_CFG: &str = "__relax_proc_macro_host";
+
 /// Per crate (by name, as the parser knows it): the compile-time environment `env!`/`option_env!`
 /// see (cargo's per-crate variables and build-script rustc-env). Set by `makepad run`; empty
 /// otherwise. Lookups fall back to the process environment like rustc.
@@ -547,6 +550,24 @@ pub fn set_crate_env(name: &str, env: Vec<(String, String)>) {
 /// Value of `env!(key)` / `option_env!(key)` in crate `krate`.
 pub fn crate_env_named(krate: &str, key: &str) -> Option<String> {
     crate_env_registered(krate, key).or_else(|| std::env::var(key).ok())
+}
+
+/// Keep host and target Cargo environments distinct even while they parse concurrently.
+pub fn crate_env_registered_in(krate: &str, key: &str, host: bool) -> Option<String> {
+    if host { crate::macro_reg::host_env_registered(krate, key) }
+    else { crate_env_registered(krate, key) }
+}
+
+/// Validate the environment that supplied a recorded value, without starting the macro host.
+pub fn late_input_content(krate: &str, kind: u8, name: &str) -> Option<Vec<u8>> {
+    match kind {
+        crate::sip::LATE_FILE => crate::vfs::read(name).ok(),
+        crate::sip::LATE_ENV | crate::sip::LATE_HOST_ENV => {
+            crate_env_registered_in(krate, name, kind == crate::sip::LATE_HOST_ENV)
+                .or_else(|| std::env::var(name).ok()).map(String::into_bytes)
+        }
+        _ => None,
+    }
 }
 
 /// The value `makepad run` registered for the crate (cargo's per-crate vars, build-script

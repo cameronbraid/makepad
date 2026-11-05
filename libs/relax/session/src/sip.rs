@@ -142,6 +142,8 @@ pub fn hash_bytes(b: &[u8]) -> u128 {
 /// re-checks them before trusting the world (C3).
 pub const LATE_FILE: u8 = 1;
 pub const LATE_ENV: u8 = 2;
+/// A proc-macro host dependency can have different Cargo build-script outputs.
+pub const LATE_HOST_ENV: u8 = 3;
 
 static LATE: crate::sync::Mutex<Option<std::collections::HashMap<(String, u8, String), u128>>> = crate::sync::Mutex::new(None);
 

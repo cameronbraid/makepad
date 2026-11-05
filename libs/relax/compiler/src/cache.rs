@@ -3798,13 +3798,10 @@ fn ledger_current(p: &Store, present: &HashSet<String>, memo: &mut HashMap<(u8, 
         }
         // each input is read once per open, however many packs name it
         let now = *memo.entry((k, c.to_string(), name.to_string())).or_insert_with(|| {
-            if k == crate::sip::LATE_FILE {
-                crate::sip::late_hash(crate::vfs::read(name).ok().as_deref())
-            } else {
-                crate::sip::late_hash(crate::crates::crate_env_named(c, name).as_deref().map(|s| s.as_bytes()))
-            }
+            crate::sip::late_hash(crate::crates::late_input_content(c, k, name).as_deref())
         });
         if now != h {
+            if crate::preload::trace() { eprintln!("boot-trace: stale late input: {c} kind {k} {name}"); }
             return false;
         }
     }
@@ -5379,8 +5376,7 @@ impl crate::crate_image::CrateImages for FrontImages {
             return None;
         }
         let late = image.late_inputs.iter().map(|(c, kind, name, hash)| {
-            let content = if *kind == crate::sip::LATE_FILE { crate::vfs::read(name).ok() }
-                else { crate::crates::crate_env_named(c, name).map(String::into_bytes) };
+            let content = crate::crates::late_input_content(c, *kind, name);
             (c, *kind, name, *hash, content)
         }).collect::<Vec<_>>();
         if late.iter().any(|(_, _, _, hash, content)| crate::sip::late_hash(content.as_deref()) != *hash) {
@@ -5440,8 +5436,7 @@ impl crate::crate_image::CrateImages for FrontImages {
                 return None;
             }
             let late = part.late_inputs.iter().map(|(c, kind, name, hash)| {
-                let content = if *kind == crate::sip::LATE_FILE { crate::vfs::read(name).ok() }
-                    else { crate::crates::crate_env_named(c, name).map(String::into_bytes) };
+                let content = crate::crates::late_input_content(c, *kind, name);
                 (c, *kind, name, *hash, content)
             }).collect::<Vec<_>>();
             if let Some((_, kind, name, _, _)) = late.iter().find(|(_, _, _, hash, content)| crate::sip::late_hash(content.as_deref()) != *hash) {
@@ -5514,7 +5509,7 @@ fn replay_front_ledger(st: &Store) -> Option<()> {
         let k = d.u8()?;
         let name = d.str()?;
         let _hash = d.u128()?;
-        let content = if k == crate::sip::LATE_FILE { crate::vfs::read(name).ok() } else { crate::crates::crate_env_named(c, name).map(String::into_bytes) };
+        let content = crate::crates::late_input_content(c, k, name);
         crate::sip::note_late_input(c, k, name, content.as_deref());
     }
     Some(())
