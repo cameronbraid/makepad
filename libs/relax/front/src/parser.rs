@@ -1821,6 +1821,7 @@ impl<'a> Parser<'a> {
         let key = crate::parse_work::rules_key(self, def, call_lo, self.toks.at(toks.hi as usize).hi);
         let (text, rtoks, origins, bodies, groups) = if let Some(x) = crate::parse_work::get_rules(&key).filter(|_| !crate::macros::uses::recording()) { x } else {
             if crate::macros::uses::recording() { crate::macros::uses::synth_clear(); }
+            let buffers = (self.ext.len(), self.toks.len());
             let x = crate::preload::timed_named(2, &def.name, || self.expand_rules(def, toks.lo as usize, toks.hi as usize)).map_err(|m| {
                 if trace {
                     eprintln!("expand {}! failed in {} using {}:{} module {}: {}", def.name, self.cur_module(), def.def_file, def.def_pos, def.def_mod, m);
@@ -1828,7 +1829,11 @@ impl<'a> Parser<'a> {
                 }
                 PErr { pos: call_lo, msg: m }
             })?;
-            crate::parse_work::put_rules(key, &x);
+            // Doc-comment desugaring appends source and tokens before transcription.
+            // Its origins refer to those buffers, which a reuse hit cannot restore.
+            if buffers == (self.ext.len(), self.toks.len()) {
+                crate::parse_work::put_rules(key, &x);
+            }
             x
         };
         if trace {
