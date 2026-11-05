@@ -6,6 +6,7 @@
 //! that the macro needs a host.
 
 use crate::crates::CrateUnit;
+use crate::crate_image::{Codec, Decode};
 use crate::pm::{Span, TokenStream};
 use std::cell::{Cell, RefCell};
 
@@ -68,14 +69,14 @@ pub struct UnitInfo {
     pub env: Vec<(String, String)>,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Derive,
     Bang,
     Attr,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Entry {
     pub unit: usize,
     pub fname: String,
@@ -103,6 +104,60 @@ impl Reg {
     fn caller_deps(&self, unit: usize) -> &[(usize, String)] {
         self.target_deps.get(&unit).map_or(&self.units[unit].deps, Vec::as_slice)
     }
+}
+
+// Collected programs contain bang-entry indices and imports of generated exports.
+// Keep the exact registry order, certified against the current host unit graph.
+crate::crate_image::fields!(UnitInfo, name, src_path, edition, features, deps, proc_macro, registry, cfgs, env);
+crate::crate_image::fields!(Entry, unit, fname, kind);
+impl crate::crate_image::Codec for Kind {
+    fn put(&self, w: &mut Vec<u8>) {
+        (match self { Self::Derive => 0u8, Self::Bang => 1, Self::Attr => 2 }).put(w);
+    }
+    fn get(r: &mut crate::crate_image::Decode<'_>) -> Option<Self> {
+        match u8::get(r)? { 0 => Some(Self::Derive), 1 => Some(Self::Bang), 2 => Some(Self::Attr), _ => None }
+    }
+}
+struct ExportImage {
+    host: u128,
+    derives: Vec<(String, Entry)>,
+    macros: Vec<(String, Entry)>,
+    helpers: Vec<(usize, String, Vec<String>)>,
+}
+crate::crate_image::fields!(ExportImage, host, derives, macros, helpers);
+fn host_identity(reg: &Reg) -> u128 {
+    let mut h = crate::sip::Sip128::new();
+    h.str("proc-macro-export-host-v1");
+    h.write(&crate::crate_image::encode(&reg.units));
+    h.finish128()
+}
+
+/// Registry metadata required by the same collected boot's macro imports and lazy bodies.
+pub fn snapshot_exports() -> Vec<u8> {
+    let image = REG.with(|r| r.borrow().as_ref().map(|r| ExportImage {
+        host: host_identity(r), derives: r.derives.clone(), macros: r.macros.clone(), helpers: r.helpers.clone(),
+    }));
+    crate::crate_image::encode(&image)
+}
+
+/// Refuse a different host graph or prescan order rather than reinterpret stored indices.
+pub fn restore_exports(bytes: &[u8]) -> Option<()> {
+    let image = crate::crate_image::decode::<Option<ExportImage>>(bytes)?;
+    REG.with(|r| {
+        let mut r = r.borrow_mut();
+        match (r.as_mut(), image) {
+            (None, None) => Some(()),
+            (Some(reg), Some(image)) => {
+                if image.host != host_identity(reg) || !image.derives.starts_with(&reg.derives)
+                    || !image.macros.starts_with(&reg.macros) || !image.helpers.starts_with(&reg.helpers)
+                    || image.derives.iter().chain(&image.macros).any(|(_, e)| e.unit >= reg.units.len() || !reg.units[e.unit].proc_macro)
+                    || image.helpers.iter().any(|(u, _, _)| *u >= reg.units.len() || !reg.units[*u].proc_macro) { return None; }
+                reg.derives = image.derives; reg.macros = image.macros; reg.helpers = image.helpers;
+                Some(())
+            }
+            _ => None,
+        }
+    })
 }
 
 /// The units in the dependency closure of the unit(s) named `krate`, themselves included. A

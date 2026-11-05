@@ -47,7 +47,7 @@ impl Drop for Parts {
 }
 fn key(identity: u128) -> u128 {
     let mut h = Sip128::new();
-    h.str("collected-graph-v1"); h.u128(front_graph_key(identity)); h.finish128()
+    h.str("collected-graph-v2"); h.u128(front_graph_key(identity)); h.finish128()
 }
 pub(super) fn path(dir: &std::path::Path, identity: u128) -> PathBuf {
     dir.join(format!("collected_graph-{:016x}.rcs", key(identity) as u64))
@@ -68,6 +68,7 @@ pub(super) struct CollectedBoot {
     definitions: Arc<crate::image::Writer<'static>>,
     files: Vec<(u32, String, u128)>,
     interfaces: Vec<MappedKey>,
+    macro_exports: Vec<u8>,
 }
 
 impl FrontImages {
@@ -323,12 +324,13 @@ impl FrontImages {
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
         let image = crate::image::Reader::new(bytes)?;
         why = "certificate identity";
-        if image.len() != 6 || image.bytes(0, 0)? != certificate(graph).to_le_bytes() { return None; }
+        if image.len() != 7 || image.bytes(0, 0)? != certificate(graph).to_le_bytes() { return None; }
         let ifaces: &[MappedKey] = image.slice(5, 5)?;
         if ifaces.len() != graph.crates.len() { return None; }
         let program = image.bytes(1, 1)?;
         let types = image.bytes(2, 2)?;
         let definitions = image.bytes(3, 3)?;
+        let macro_exports = image.bytes(6, 6)?;
         phase("mapped");
         let options = crate::crate_image::parse_options(&session.options);
         let store_paths: Vec<PathBuf> = graph.crates.iter()
@@ -463,6 +465,10 @@ impl FrontImages {
         drop(cert);
         self.end_load();
         phase("restored");
+        // Publish only after the entire snapshot has passed validation. A rejected
+        // record must not leave stale generated names in the live registry.
+        why = "proc-macro exports";
+        crate::macro_reg::restore_exports(macro_exports)?;
         if session.options.verbose {
             eprintln!("makepad-run collected: restored {} crates, {} definitions, {} types", prog.crates.len(), prog.defs.len(), tcx.tys.len());
         }
@@ -631,7 +637,7 @@ impl Encoder<'_> {
             let path = prog.file_paths.get(f)?;
             Some((*prog.file_crate.get(f)?, path.clone(), file.source_hash(path)))
         }).collect::<Option<Vec<_>>>()?;
-        Some(CollectedBoot { recipe: recipe.clone(), program, types, definitions, files, interfaces })
+        Some(CollectedBoot { recipe: recipe.clone(), program, types, definitions, files, interfaces, macro_exports: crate::macro_reg::snapshot_exports() })
     }
 
     fn definitions(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> Option<crate::image::Writer<'static>> {
@@ -691,6 +697,7 @@ impl Encoder<'_> {
         why = "index snapshot";
         image.add_bytes(4, MappedIndexes::record(self.crate_path, &boot.files)?);
         image.add_owned(5, &boot.interfaces);
+        image.add_bytes(6, boot.macro_exports.clone());
         check()?;
         let payload = image;
         let dest = path(self.dir, recipe.identity);
@@ -745,7 +752,7 @@ impl Cache {
         pin_front(&st, Some(at));
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
         let image = crate::image::Reader::new(bytes)?;
-        if image.len() != 6 { return None; }
+        if image.len() != 7 { return None; }
         let (program, types) = (image.bytes(1, 1)?, image.bytes(2, 2)?);
         prog.adopt_collected(program, retired, &mut note)?;
         tcx.adopt_collected(types, retired, &mut note)?;
