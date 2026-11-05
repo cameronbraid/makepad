@@ -209,7 +209,9 @@ const LEDGER_KEY: u128 = 0;
 // symbol names which block of its entry it is (its ordinal), so two relocations to different
 // offsets of one block link to one block. 29: image symbol and closure-parent key spans (image.rs
 // skip_*) follow the encoding again; images written before cut keys short.
-const ENTRY_VERSION: u32 = 29;
+// 30: closure types retain whether they are coroutines, including when their
+// cached constructors skip the type check that originally published that fact.
+const ENTRY_VERSION: u32 = 30;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -1672,6 +1674,7 @@ impl Cache {
                 self.enc_file(u, file, e)?;
                 e.u32(expr);
                 e.u64(self.closure_fp(u, file, expr)?);
+                e.u8(u.tcx.is_coroutine(t) as u8);
                 self.enc_ty(u, closure_kind_ty, e, crates, depth + 1)?; self.enc_ty(u, sig, e, crates, depth + 1)?; self.enc_ty(u, state, e, crates, depth + 1)?;
                 // The kind and tupled upvars are the type's own args (ClosureArgs).
                 return self.enc_ty(u, owner, e, crates, depth + 1);
@@ -1889,10 +1892,12 @@ impl Cache {
                 let file = self.dec_file(u, d)?;
                 let expr = d.u32()?;
                 if !self.closure_fp_agrees(u, file, expr, d.u64()?) { return None; }
+                let coroutine = match d.u8()? { 0 => false, 1 => true, _ => return None };
                 let kind = self.dec_ty(u, d, depth + 1)?;
                 let sig = self.dec_ty(u, d, depth + 1)?;
                 let state = self.dec_ty(u, d, depth + 1)?;
                 let owner = self.dec_ty(u, d, depth + 1)?;
+                if coroutine { u.tcx.coroutines.insert((file, expr), ()); }
                 TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state })
             }
             18 => {
