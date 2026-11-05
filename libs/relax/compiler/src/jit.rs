@@ -18816,8 +18816,8 @@ pub(crate) fn live_needs_present(needs_present: bool) {
     LIVE_NEEDS_PRESENT.store(needs_present, Ordering::Release);
 }
 
-/// A program that links makepad_platform takes live edits only after its first present; the
-/// quiet release of a headless start (startup_main) admits them only for other programs.
+/// Live edits and warm-cache writes wait for the first present in makepad_platform programs;
+/// the quiet release of a headless start (startup_main) admits them for other programs.
 pub(crate) fn live_startup_done() -> bool {
     FIRST_PRESENT.load(Ordering::Acquire)
         || LIVE_STARTUP_DONE.load(Ordering::Acquire) && !LIVE_NEEDS_PRESENT.load(Ordering::Acquire)
@@ -18948,6 +18948,11 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
             std::thread::park_timeout(std::time::Duration::from_nanos(STARTUP_QUIET_NS.saturating_sub(quiet).max(50_000_000)));
         }
         LIVE_STARTUP_DONE.store(true, Ordering::Release);
+        // Headless programs never call relax_first_present. Start their deferred
+        // crate records and graph here so warm snapshots do not depend on exit.
+        if live_startup_done() && !FIRST_PRESENT.load(Ordering::Acquire) {
+            crate::cache::start_deferred_front();
+        }
         if !startup_phase() { return; }
         relax_codegen::fncost::mark(if FIRST_PRESENT.load(Ordering::Acquire) {
             "startup released: present"

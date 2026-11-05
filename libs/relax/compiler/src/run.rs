@@ -2548,15 +2548,16 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 let start = MAIN_START_WALL.load(Ordering::Relaxed);
                 let since = main_ms.saturating_sub(mid_last);
                 // also with no new code: the manifest whose window closed, the collected program
-                let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
+                let startup_done = jit::live_startup_done();
+                let left = !MID_MANIFEST_DONE.load(Ordering::Relaxed) && startup_done && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed)
                     || !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed)
-                    || jit::FIRST_PRESENT.load(Ordering::Acquire) && crate::cache::front_graph_pending();
+                    || startup_done && crate::cache::front_graph_pending();
                 // the warm record (manifest, front graph, collected program) is written as soon
-                // as its pieces are ready after the first present, not after seconds of quiet
+                // as its pieces are ready after the first present or a headless quiet start
                 // (a cold run compiles O2 code for long after it): users close apps quickly, and
                 // a killed run that wrote nothing left every relaunch unrestored. At most once a
                 // second; the collected program's encode makes a unit call only when free.
-                let record = left && jit::FIRST_PRESENT.load(Ordering::Acquire) && since >= 1_000;
+                let record = left && startup_done && since >= 1_000;
                 // a trickle of first compiles counts as quiet (SettleWatch: a game keeps reaching code)
                 let mid_still = mid_quiet >= 20 || settle_watch.slow(jit::demand_compiled());
                 let due = n != mid_flushed && ((mid_still && since >= 5_000) || since >= 10_000) || left && mid_still && since >= 5_000;
@@ -3252,7 +3253,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         // (the quit write records it again when the session installed more since: the whole
         // session's order, linked ahead by the next launch)
         let again = jit::QUIT_SEEN.load(Ordering::Relaxed) && MID_MANIFEST_DONE.load(Ordering::Relaxed) && u.start_order.len() > MID_MANIFEST_LEN.load(Ordering::Relaxed);
-        if u.cache.is_some() && jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!MID_MANIFEST_DONE.swap(true, Ordering::Relaxed) || again) {
+        if u.cache.is_some() && jit::live_startup_done() && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && (!MID_MANIFEST_DONE.swap(true, Ordering::Relaxed) || again) {
             MID_MANIFEST_LEN.store(u.start_order.len(), Ordering::Relaxed);
             let (order, present) = jit::manifest_order(u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
@@ -3300,13 +3301,13 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         Some(s) => s.write().ok()?,
         None => 0,
     };
-    // the front images' line once the program presented (a process ended by its framework
-    // never prints the exit summary): files mapped, images not matching, arrays copied back
+    // Report front images after startup (a process ended by its framework never prints
+    // the exit summary): files mapped, images not matching, arrays copied back
     static FRONT_REPORTED: AtomicBool = AtomicBool::new(false);
-    if jit::FIRST_PRESENT.load(Ordering::Acquire) && !FRONT_REPORTED.swap(true, Ordering::Relaxed) {
-        if let Some(s) = crate::front::summary() { verbose!("{} (after the first present)", s); }
+    if jit::live_startup_done() && !FRONT_REPORTED.swap(true, Ordering::Relaxed) {
+        if let Some(s) = crate::front::summary() { verbose!("{} (after startup)", s); }
     }
-    let graph_ready = jit::FIRST_PRESENT.load(Ordering::Acquire)
+    let graph_ready = jit::live_startup_done()
         && crate::cache::Cache::flush_front_graphs().is_ok();
     // the collected program, once per run and only when the program is quiet (it is encoded
     // under the unit and front-end locks): not at the exit

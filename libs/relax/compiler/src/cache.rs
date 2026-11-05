@@ -4694,8 +4694,8 @@ impl FrontGraphWrite {
     }
 }
 
-/// A boot's crate records and its graph, written after the first present (`flush_front_graphs`, from
-/// the first-present hook, the mid-run writer and the exit): the records first (each store is
+/// A boot's crate records and graph, written after startup (`flush_front_graphs`, from the
+/// first-present hook, headless quiet release, mid-run writer and exit): records first (each store is
 /// complete before the graph certifies it), then the graph.
 struct DeferredFront {
     writers: Option<FrontWriters>,
@@ -4704,7 +4704,7 @@ struct DeferredFront {
 static DEFERRED_FRONT: relax_session::sync::Mutex<Vec<DeferredFront>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// Starts the writer of the boot's deferred records and graph on its own thread (low priority). Called
-/// at the first present; anything not started by then is written by the mid-run writer or the exit.
+/// at the first present or headless quiet release; the mid-run writer or exit handles any remainder.
 pub fn start_deferred_front() {
     if DEFERRED_FRONT.lock().unwrap().is_empty() { return; }
     let _k = crate::zone_alloc::kept();
@@ -4713,7 +4713,7 @@ pub fn start_deferred_front() {
         let t = std::time::Instant::now();
         let r = flush_front_graphs();
         if crate::preload::trace() {
-            eprintln!("makepad-run front: records and graph written after the first present: {:?} in {:.1} ms (t={:.0} ms)", r, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
+            eprintln!("makepad-run front: records and graph written after startup: {:?} in {:.1} ms (t={:.0} ms)", r, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
         }
     });
 }
