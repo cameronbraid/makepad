@@ -979,6 +979,24 @@ fn scan_file(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg:
     scan_text(path, dir, mpath, krate, edition, cfg, context.read_source(path).ok()?.src.to_vec().into(), context)
 }
 
+/// Entry discovery needs exported helper macros from module files too. Use the
+/// same configured module traversal as the loader, including path attributes.
+pub(crate) fn macro_rules_for_crate(root: &str, krate: &str, edition: u16, cfg: &CfgSet) -> Vec<crate::macros::MacroDef> {
+    let sources = Arc::new(crate::source::SourceRegistry::default());
+    let context = crate::source_context::Context::new(root, sources, &cfg.session);
+    let mut stack = vec![(root.to_string(), crate::program::dir_of(root).to_string(), krate.to_string())];
+    let mut seen = HashSet::default();
+    let mut defs = Vec::new();
+    while let Some((path, dir, module)) = stack.pop() {
+        if !seen.insert(path.clone()) { continue; }
+        if let Some(scan) = scan_file(&path, &dir, &module, krate, edition, cfg, &context) {
+            defs.extend(scan.defs);
+            stack.extend(scan.children.into_iter().rev());
+        }
+    }
+    defs
+}
+
 fn scan_text(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, src: ScanBytes, context: &crate::source_context::Context) -> Option<Scanned> {
     scan_text_mode(path, dir, mpath, krate, edition, cfg, src, context, false)
 }

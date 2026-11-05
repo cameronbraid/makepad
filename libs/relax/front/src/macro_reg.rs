@@ -772,51 +772,6 @@ pub fn has_derive(name: &str) -> bool {
     REG.with(|r| r.borrow().as_ref().map_or(false, |r| r.derives.iter().any(|(n, _)| n == name)))
 }
 
-/// Collects `macro_rules!` definitions from a crate's root file for proc-macro entry discovery.
-fn collect_macro_rules_defs(root: &str, krate: &str, edition: u16) -> Vec<crate::macros::MacroDef> {
-    use crate::lexer::T;
-    let Ok(src) = crate::vfs::read(root) else { return Vec::new() };
-    let mut toks = Vec::new();
-    if crate::lexer::lex(&src, edition, &mut toks).is_err() {
-        return Vec::new();
-    }
-    let text = |i: usize| -> &[u8] { &src[toks[i].lo as usize..toks[i].hi as usize] };
-    let mut defs = Vec::new();
-    let mut i = 0;
-    while i < toks.len() {
-        if toks[i].kind == T::Ident && text(i) == b"macro_rules" && i + 3 < toks.len() && toks[i + 1].kind == T::Not {
-            let name = String::from_utf8_lossy(text(i + 2)).trim_start_matches("r#").to_string();
-            let open = i + 3;
-            let mut d = 0i32;
-            let mut close = open;
-            while close < toks.len() {
-                match toks[close].kind {
-                    T::OpenParen | T::OpenBracket | T::OpenBrace => d += 1,
-                    T::CloseParen | T::CloseBracket | T::CloseBrace => {
-                        d -= 1;
-                        if d == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                close += 1;
-            }
-            if close > open {
-                let mt = crate::macros::definition_tokens(&toks[open + 1..close.min(toks.len())],
-                    |lo, hi| &src[lo as usize..hi as usize]);
-                if let Ok(def) = crate::macros::parse_def(&name, krate, edition, &mt) {
-                    defs.push(def);
-                }
-            }
-            i = close + 1;
-            continue;
-        }
-        i += 1;
-    }
-    defs
-}
-
 /// `#[proc_macro_derive(Name, ..)]` / `#[proc_macro]` / `#[proc_macro_attribute]` fns of a
 /// proc-macro crate (token scan of its files, following `mod x;` and expanding top-level
 /// `macro_rules!` invocations that generate proc-macro entry points).
@@ -828,12 +783,16 @@ fn scan_entries(sess: &std::sync::Arc<crate::Session>, reg: &mut Reg, unit: usiz
     for c in &u.cfgs {
         cfg.set.push(c.replace('"', ""));
     }
-    let mut local_defs = collect_macro_rules_defs(root, &u.name, edition);
+    let mut local_defs = crate::preload::macro_rules_for_crate(root, &u.name, edition, &cfg);
     let deps: Vec<(usize, String)> = u.deps.clone();
     for (dep_idx, _) in deps {
         if let Some(dep_u) = reg.units.get(dep_idx) {
             if !dep_u.proc_macro {
-                local_defs.extend(collect_macro_rules_defs(&dep_u.src_path, &dep_u.name, dep_u.edition));
+                let mut dep_cfg = crate::cfg::CfgSet::machine(sess, &dep_u.features);
+                dep_cfg.set.push("relax".to_string());
+                for c in &dep_u.cfgs { dep_cfg.set.push(c.replace('"', "")); }
+                local_defs.extend(crate::preload::macro_rules_for_crate(&dep_u.src_path, &dep_u.name, dep_u.edition, &dep_cfg)
+                    .into_iter().filter(|d| d.exported));
             }
         }
     }
