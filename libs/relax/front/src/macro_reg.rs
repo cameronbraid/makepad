@@ -772,6 +772,72 @@ pub fn has_derive(name: &str) -> bool {
     REG.with(|r| r.borrow().as_ref().map_or(false, |r| r.derives.iter().any(|(n, _)| n == name)))
 }
 
+/// Publish the root exports after dependent proc macros have expanded their declarations.
+/// The token prescan cannot see attributes emitted by another attribute macro.
+pub fn register_expanded_exports(prog: &crate::program::Program, krate: u32, unit: usize) {
+    let root = prog.mods[prog.crates[krate as usize].root_mod as usize].def;
+    REG.with(|r| {
+        let mut r = r.borrow_mut();
+        let Some(reg) = r.as_mut() else { return; };
+        for def in &prog.defs {
+            if def.krate != krate || def.parent != root || !def.is_pub || def.kind != crate::program::DefKind::Fn { continue; }
+            let ast = &prog.files[def.file as usize].ast;
+            register_attrs(reg, unit, prog.syms.str(def.name), prog.src(def.file), ast.list(ast.item(def.item).attrs));
+        }
+    });
+}
+
+fn register_attrs(reg: &mut Reg, unit: usize, fname: &str, src: crate::cfg::Src<'_>, attrs: &[crate::ast::Attr]) {
+    use crate::lexer::T;
+    for attr in attrs {
+        let lo = attr.toks.lo as usize;
+        let hi = attr.toks.hi as usize;
+        if lo >= hi { continue; }
+        let kind = match crate::cfg::tok_str(src, lo) {
+            b"proc_macro_derive" => Kind::Derive,
+            b"proc_macro" => Kind::Bang,
+            b"proc_macro_attribute" => Kind::Attr,
+            _ => continue,
+        };
+        let mut name = String::new();
+        let mut helpers = Vec::new();
+        if kind == Kind::Derive {
+            if lo + 2 >= hi || src.tok(lo + 1).kind != T::OpenParen || !matches!(src.tok(lo + 2).kind, T::Ident | T::RawIdent) { continue; }
+            name = String::from_utf8_lossy(crate::cfg::tok_str(src, lo + 2)).trim_start_matches("r#").to_string();
+            let mut k = lo + 3;
+            while k + 1 < hi {
+                if crate::cfg::tok_str(src, k) == b"attributes" && src.tok(k + 1).kind == T::OpenParen {
+                    k += 2;
+                    while k < hi && src.tok(k).kind != T::CloseParen {
+                        if matches!(src.tok(k).kind, T::Ident | T::RawIdent) {
+                            helpers.push(String::from_utf8_lossy(crate::cfg::tok_str(src, k)).trim_start_matches("r#").to_string());
+                        }
+                        k += 1;
+                    }
+                    break;
+                }
+                k += 1;
+            }
+        }
+        let e = Entry { unit, fname: fname.to_string(), kind };
+        match kind {
+            Kind::Derive => {
+                if !helpers.is_empty() && !reg.helpers.iter().any(|(u, n, hs)| *u == unit && n == &name && hs == &helpers) {
+                    reg.helpers.push((unit, name.clone(), helpers));
+                }
+                if !reg.derives.iter().any(|(n, ex)| n == &name && ex.unit == unit && ex.fname == e.fname) {
+                    reg.derives.push((name, e));
+                }
+            }
+            _ => {
+                if !reg.macros.iter().any(|(n, ex)| n == fname && ex.unit == unit && ex.kind == kind) {
+                    reg.macros.push((fname.to_string(), e));
+                }
+            }
+        }
+    }
+}
+
 /// `#[proc_macro_derive(Name, ..)]` / `#[proc_macro]` / `#[proc_macro_attribute]` fns of a
 /// proc-macro crate (token scan of its files, following `mod x;` and expanding top-level
 /// `macro_rules!` invocations that generate proc-macro entry points).
@@ -876,54 +942,7 @@ fn scan_tokens_for_entries(
                 // parser's configured view before publishing names or helpers.
                 let attrs = crate::cfg::attrs_before(p_src, i, cfg);
                 if crate::cfg::active(p_src, &attrs, cfg) {
-                    for attr in &attrs {
-                        let lo = attr.toks.lo as usize;
-                        let hi = attr.toks.hi as usize;
-                        if lo >= hi { continue; }
-                        let kind = match text(lo) {
-                            b"proc_macro_derive" => Kind::Derive,
-                            b"proc_macro" => Kind::Bang,
-                            b"proc_macro_attribute" => Kind::Attr,
-                            _ => continue,
-                        };
-                        let mut name = String::new();
-                        let mut helpers = Vec::new();
-                        if kind == Kind::Derive {
-                            if lo + 2 >= hi || toks[lo + 1].kind != T::OpenParen || !matches!(toks[lo + 2].kind, T::Ident | T::RawIdent) { continue; }
-                            name = String::from_utf8_lossy(text(lo + 2)).trim_start_matches("r#").to_string();
-                            let mut k = lo + 3;
-                            while k + 1 < hi {
-                                if text(k) == b"attributes" && toks[k + 1].kind == T::OpenParen {
-                                    k += 2;
-                                    while k < hi && toks[k].kind != T::CloseParen {
-                                        if matches!(toks[k].kind, T::Ident | T::RawIdent) {
-                                            helpers.push(String::from_utf8_lossy(text(k)).trim_start_matches("r#").to_string());
-                                        }
-                                        k += 1;
-                                    }
-                                    break;
-                                }
-                                k += 1;
-                            }
-                        }
-                        let fname = String::from_utf8_lossy(text(i + 1)).trim_start_matches("r#").to_string();
-                        let e = Entry { unit, fname: fname.clone(), kind };
-                        match kind {
-                            Kind::Derive => {
-                                if !helpers.is_empty() && !reg.helpers.iter().any(|(u, n, hs)| *u == unit && n == &name && hs == &helpers) {
-                                    reg.helpers.push((unit, name.clone(), helpers));
-                                }
-                                if !reg.derives.iter().any(|(n, ex)| n == &name && ex.unit == unit && ex.fname == e.fname) {
-                                    reg.derives.push((name, e));
-                                }
-                            }
-                            _ => {
-                                if !reg.macros.iter().any(|(n, ex)| n == &fname && ex.unit == unit && ex.kind == kind) {
-                                    reg.macros.push((fname, e));
-                                }
-                            }
-                        }
-                    }
+                    register_attrs(reg, unit, String::from_utf8_lossy(text(i + 1)).trim_start_matches("r#"), p_src, &attrs);
                 }
             }
             T::Ident if brace_depth == 0 && depth < 8 && !local_defs.is_empty() => {

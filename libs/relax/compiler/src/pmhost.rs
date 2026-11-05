@@ -572,6 +572,7 @@ fn build_world_inner(sess: &std::sync::Arc<crate::Session>, units: &[crate::macr
             };
             let k = prog.load_crate_deferred(&u.name, &u.src_path, u.edition, cs, deps).map_err(|e| format!("macro crate {}: {}", u.name, e))?;
             drop(_allow);
+            if u.proc_macro { crate::macro_reg::register_expanded_exports(&prog, k, i); }
             crate_of[i] = k;
             done[i] = true;
             progress = true;
