@@ -1724,6 +1724,29 @@ fn async_signature(u: &Unit, d: DefId) -> Option<Vec<Vec<u8>>> {
     Some(toks_norm(pf, item.lo, end, &[]))
 }
 
+// Retired opaque declarations cannot always be normalized after an edit. A
+// compiled async poll retains its concrete output identity independently of those
+// declarations. Use that identity, never its layout or a new hidden type for it.
+fn factory_async_output(u: &Unit, d: DefId, args: &[TyId]) -> Option<TyId> {
+    let concrete = |ty| u.tcx.tys.is_concrete(ty)
+        && !u.tcx.tys.flags(ty).intersects(crate::types::TypeFlags::HAS_ALIAS);
+    if let Some(slot) = u.fn_map.get(&FnKey::Inst(d, args.to_vec())) {
+        for child in u.closures_of_slots([slot]) {
+            if !matches!(u.fns[child as usize].key, FnKey::Closure(_, ce, _) if ce & crate::tcx::ASYNC_FN_BODY != 0) { continue; }
+            let Some(ty) = u.tcx.coro_slot_ty.get(&child) else { continue };
+            let crate::types::TyKind::Closure(_, _, caps) = u.tcx.tys.kind(ty) else { continue };
+            let crate::types::TyKind::FnPtr(_, ret, _, _) = u.tcx.tys.kind(caps.closure_sig_as_fn_ptr_ty) else { continue };
+            if concrete(*ret) { return Some(*ret); }
+        }
+    }
+    u.tcx.fn_sig(&u.prog, d)?;
+    let ty = u.tcx.async_fns.get(&d)?;
+    let ty = u.tcx.try_normalize_erasing_regions(&u.prog,
+        crate::tcx::TypingEnv::fully_monomorphized(&u.prog),
+        u.tcx.tys.subst_erasing_regions(ty, args)).ok()?;
+    concrete(ty).then_some(ty)
+}
+
 // A function item has no stored bytes or drop state. Its replacement can be
 // captured by a retained factory without replacing any future the factory made.
 fn factory_capture_eq(u: &Unit, a: TyId, b: TyId) -> bool {
@@ -1734,15 +1757,9 @@ fn factory_capture_eq(u: &Unit, a: TyId, b: TyId) -> bool {
                 && async_signature(u, *ad).is_some()
                 && async_signature(u, *ad) == async_signature(u, *bd)
                 && {
-                    let output = |d| {
-                        u.tcx.fn_sig(&u.prog, d)?;
-                        let ty = u.tcx.async_fns.get(&d)?;
-                        let ty = u.tcx.normalize_erasing_regions(&u.prog,
-                            crate::tcx::TypingEnv::fully_monomorphized(&u.prog),
-                            u.tcx.tys.subst_erasing_regions(ty, u.tcx.tys.list(*aa)));
-                        (ty != u.tcx.tys.error).then_some(ty)
-                    };
-                    output(*ad).is_some() && output(*ad) == output(*bd)
+                    let (a, b) = (factory_async_output(u, *ad, u.tcx.tys.list(*aa)),
+                        factory_async_output(u, *bd, u.tcx.tys.list(*ba)));
+                    a.is_some() && a == b
                 }
         }
         _ => false,
