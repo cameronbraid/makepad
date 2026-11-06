@@ -3592,6 +3592,10 @@ static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 static PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Unpinned: the watch's next round looks at every file.
 static CATCH_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Watch rounds the live watcher has begun past its gates (`__relax_live_sync`).
+static WATCH_ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Edits refused and not since patched: (the edit's name as reported, its reasons).
+static REFUSED_EDITS: relax_session::sync::Mutex<Vec<(String, Vec<String>)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// `inspect pin on|off`: while on, no edit or landing reaches the running app and it does not
 /// restart; off, it catches up (patches, or the rebuilt makepad that waited). Returns the state.
@@ -3751,11 +3755,51 @@ fn patch_landed(paths: impl Iterator<Item = String>) {
         p.0 += 1;
         let n = p.0;
         for path in paths {
+            // (a refusal is named by its path or its file name)
+            REFUSED_EDITS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(w, _)| *w != path && !path.ends_with(&format!("/{w}")));
             p.1.retain(|(_, q)| *q != path);
             p.1.push((n, path));
         }
     }
     wake_program();
+}
+
+/// Brings the running program up to its saved sources before the caller goes on (a test
+/// daemon's request): one round of the live watcher that looks at every file, then the next
+/// round (the first one's edits are applied by then). Returns 0 when synced, 1 on timeout
+/// (`timeout_ms`), 2 without a live session, 3 when edits wait for a restart. `buf` gets, for 3,
+/// the reasons the restart is due, else the edits still refused: one "<edit>\t<reason>" line
+/// each; the byte count goes to `*len`.
+pub extern "C" fn __relax_live_sync(timeout_ms: u64, buf: *mut u8, cap: usize, len: *mut usize) -> u32 {
+    crate::jit::host_boundary("__relax_live_sync", move || {
+        use std::sync::atomic::Ordering;
+        if !crate::layout::LIVE_SESSION.load(Ordering::Relaxed) { return 2; }
+        let start = WATCH_ROUNDS.load(Ordering::Acquire);
+        CATCH_UP.store(true, Ordering::Release);
+        watch_events::kick();
+        let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let mut code = 0;
+        while WATCH_ROUNDS.load(Ordering::Acquire) < start + 2 {
+            if Instant::now() >= deadline { code = 1; break; }
+            watch_events::kick();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut text = String::new();
+        let pending = RESTART_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if code == 0 && !pending.is_empty() {
+            code = 3;
+            for why in &pending { text.push_str(why); text.push('\n'); }
+        } else {
+            for (what, lines) in REFUSED_EDITS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                if lines.iter().any(|l| l.contains("restart the app")) { continue; }
+                for l in lines { text.push_str(what); text.push('\t'); text.push_str(l); text.push('\n'); }
+            }
+        }
+        let n = text.len().min(cap);
+        if !buf.is_null() { unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), buf, n) }; }
+        if !len.is_null() { unsafe { *len = n }; }
+        code
+    })
 }
 
 /// The files patched after count `since`: "<count>\n" then one path per line.
@@ -4171,6 +4215,11 @@ pub fn clear_restart_pending() {
 }
 
 fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
+    {
+        let mut r = REFUSED_EDITS.lock().unwrap_or_else(|e| e.into_inner());
+        r.retain(|(w, _)| w != what);
+        r.push((what.to_string(), lines.to_vec()));
+    }
     let reasons: Vec<String> = lines.iter().take(6).map(|l| crate::inspect::json_str(l)).collect();
     crate::inspect::events::emit(
         "patchrefused",
@@ -4356,6 +4405,7 @@ pub fn restart_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_restart_now" => __relax_restart_now as *const () as usize,
         b"__relax_live_stream" => __relax_live_stream as *const () as usize,
         b"__relax_live_log" => __relax_live_log as *const () as usize,
+        b"__relax_live_sync" => __relax_live_sync as *const () as usize,
         _ => return crate::inspect::engine_req::symbol(name),
     })
 }
@@ -4717,6 +4767,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         // UI thread's first lazy links queued behind it (36 ms of a first post-present episode)
         if startup_scan && crate::postframe::in_first_frames() { continue; }
         gate_note(0);
+        WATCH_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let loads = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
         // a new watch set drops the events the old one had not delivered yet (a save made
         // while the post-boot loader loads was never seen): stat every file once instead

@@ -700,7 +700,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // A store run whose embedder writes pushed sources into its edits folder (the Android host's
     // devhub store applier) asks for a live session with MAKEPAD_RUN_STORE_LIVE=1.
     let store_live = std::env::var_os("MAKEPAD_RUN_STORE_LIVE").is_some_and(|v| v == "1") && crate::vfs::edits_enabled();
-    if !check && !harness && plain_test.is_none() && !no_live && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
+    // (`RELAX_TEST_SERVE`: a test daemon applies saves between requests, std/relax/test.rs)
+    let serving = harness && std::env::var_os("RELAX_TEST_SERVE").is_some();
+    if !check && (!harness || serving) && plain_test.is_none() && !no_live && std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_none() && !SILENT.load(Ordering::Relaxed)
         && (store_live || !crate::vfs::is_virtual(&workspace_dir())) {
         driver_options.live = true;
     }

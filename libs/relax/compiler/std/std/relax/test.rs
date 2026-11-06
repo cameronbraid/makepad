@@ -77,6 +77,8 @@ struct Opts {
     /// libtest OutputFormat::Terse (`-q` / `--format=terse`): one character per test
     quiet: bool,
     threads: usize,
+    /// The daemon's limit for one test without a result (RELAX_TEST_TIMEOUT seconds)
+    timeout: Option<crate::time::Duration>,
 }
 
 /// libtest cli.rs get_format: `--format` (pretty, terse; json and junit only on nightly with
@@ -90,10 +92,10 @@ fn format_terse(v: &str) -> Result<bool, String> {
     }
 }
 
-fn parse_args() -> Result<Opts, String> {
-    let mut o = Opts { filters: Vec::new(), skip: Vec::new(), exact: false, ignored: false, include_ignored: false, list: false, quiet: false, threads: 0 };
+fn parse_args(args: Vec<String>) -> Result<Opts, String> {
+    let mut o = Opts { filters: Vec::new(), skip: Vec::new(), exact: false, ignored: false, include_ignored: false, list: false, quiet: false, threads: 0, timeout: None };
     let mut format: Option<bool> = None;
-    let mut args = crate::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--exact" => o.exact = true,
@@ -175,19 +177,129 @@ fn run_one(d: &Desc) -> Outcome {
     }
 }
 
-/// Runs the table's tests; the exit status goes to `t.code`.
+/// Runs the table's tests; the exit status goes to `t.code`. With `RELAX_TEST_SERVE=<socket>`
+/// the harness is a test daemon instead (`serve`).
 pub fn main(t: &mut Tests) {
-    t.code = run(t);
-}
-
-fn run(t: &Tests) -> i32 {
-    let opts = match parse_args() {
-        Ok(o) => o,
+    if let Ok(path) = crate::env::var("RELAX_TEST_SERVE") {
+        t.code = serve(t, &path);
+        return;
+    }
+    t.code = match parse_args(crate::env::args().skip(1).collect()) {
+        Ok(opts) => run(t, &opts, &mut Out { conn: None }),
         Err(e) => {
             eprintln!("error: {}", e);
+            101
+        }
+    };
+}
+
+/// Where a run's report goes: stdout, and a daemon request's connection.
+struct Out {
+    conn: Option<crate::os::unix::net::UnixStream>,
+}
+
+impl Out {
+    fn put(&mut self, s: &str) {
+        print!("{}", s);
+        let _ = crate::io::stdout().flush();
+        if let Some(c) = &mut self.conn {
+            // a client that went away does not stop the run
+            if c.write_all(s.as_bytes()).is_err() {
+                self.conn = None;
+            }
+        }
+    }
+    fn line(&mut self, s: &str) {
+        self.put(s);
+        self.put("\n");
+    }
+}
+
+extern "C" {
+    fn __relax_live_sync(timeout_ms: u64, buf: *mut u8, cap: usize, len: *mut usize) -> u32;
+}
+
+/// The test daemon: the program stays loaded and answers requests on a Unix socket, so a
+/// test after an edit costs the edit's patch and the test, not a fresh start. A request is
+/// one line of libtest arguments separated by tabs. Before running it the daemon applies the
+/// saved sources (the live watcher's patches); an edit that was refused fails the request
+/// instead of testing the previous code. The report streams back and ends with
+/// `relax-test-serve: exit <code>`. An edit that needs a restart restarts the process (same
+/// command line), which closes the connection; the client retries.
+fn serve(t: &Tests, path: &str) -> i32 {
+    use crate::io::BufRead;
+    let _ = crate::fs::remove_file(path);
+    let listener = match crate::os::unix::net::UnixListener::bind(path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("relax-test-serve: cannot listen on {}: {}", path, e);
             return 101;
         }
     };
+    eprintln!("relax-test-serve: listening on {}", path);
+    for conn in listener.incoming() {
+        let Ok(conn) = conn else { continue };
+        let mut request = String::new();
+        let read = match conn.try_clone() {
+            Ok(c) => crate::io::BufReader::new(c).read_line(&mut request),
+            Err(e) => Err(e),
+        };
+        if read.is_err() {
+            continue;
+        }
+        let args: Vec<String> = request.trim_end_matches(['\r', '\n']).split('\t').filter(|a| !a.is_empty()).map(String::from).collect();
+        let mut out = Out { conn: Some(conn) };
+        let mut refused = Vec::with_capacity(1 << 16);
+        let mut n = 0usize;
+        let synced = unsafe { __relax_live_sync(60_000, refused.as_mut_ptr(), refused.capacity(), &mut n) };
+        unsafe { refused.set_len(n) };
+        // an edit the running program cannot take: start again with it (same command line);
+        // the connection closes and the client asks the restarted daemon
+        if synced == 3 {
+            out.put(&format!("relax-test-serve: restarting for:\n{}", String::from_utf8_lossy(&refused)));
+            drop(out);
+            crate::relax::restart_now("");
+            eprintln!("relax-test-serve: the restart failed");
+            return 101;
+        }
+        let code = if !refused.is_empty() {
+            out.line("relax-test-serve: edits not applied; fix them before testing:");
+            out.put(&String::from_utf8_lossy(&refused));
+            101
+        } else if synced == 1 {
+            out.line("relax-test-serve: the saved sources could not be applied in time (a restart may be due)");
+            101
+        } else {
+            match parse_args(args) {
+                Ok(mut opts) => {
+                    let secs = crate::env::var("RELAX_TEST_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(120u64);
+                    opts.timeout = Some(crate::time::Duration::from_secs(secs));
+                    run(t, &opts, &mut out)
+                }
+                Err(e) => {
+                    out.line(&format!("error: {}", e));
+                    101
+                }
+            }
+        };
+        if TIMED_OUT.load(crate::sync::atomic::Ordering::Relaxed) {
+            // an abandoned test still runs and may hold what the next one needs: start again
+            out.line("relax-test-serve: restarting: a test timed out and was abandoned");
+            out.line(&format!("relax-test-serve: exit {}", code));
+            drop(out);
+            crate::relax::restart_now("");
+            eprintln!("relax-test-serve: the restart failed");
+            return 101;
+        }
+        out.line(&format!("relax-test-serve: exit {}", code));
+    }
+    0
+}
+
+/// A daemon request left a test running past its limit (`Opts::timeout`).
+static TIMED_OUT: crate::sync::atomic::AtomicBool = crate::sync::atomic::AtomicBool::new(false);
+
+fn run(t: &Tests, opts: &Opts, out: &mut Out) -> i32 {
     let mut all: Vec<Desc> = Vec::with_capacity(t.len);
     for i in 0..t.len {
         let x = unsafe { &*t.tests.add(i) };
@@ -221,17 +333,17 @@ fn run(t: &Tests) -> i32 {
     all.sort_by(|a, b| a.name.cmp(&b.name));
     if opts.list {
         for d in &all {
-            println!("{}: test", d.name);
+            out.line(&format!("{}: test", d.name));
         }
         if !opts.quiet {
-            println!();
-            println!("{} tests, 0 benchmarks", all.len());
+            out.line("");
+            out.line(&format!("{} tests, 0 benchmarks", all.len()));
         }
         return 0;
     }
     let started = crate::time::Instant::now();
-    println!();
-    println!("running {} test{}", all.len(), if all.len() == 1 { "" } else { "s" });
+    out.line("");
+    out.line(&format!("running {} test{}", all.len(), if all.len() == 1 { "" } else { "s" }));
     let mut passed = 0usize;
     let mut ignored = 0usize;
     let mut failures: Vec<(String, Option<String>)> = Vec::new();
@@ -253,26 +365,25 @@ fn run(t: &Tests) -> i32 {
             match &o {
                 Outcome::Failed(_) => {
                     if test_column != 0 {
-                        print!(" {}/{}\n", test_count, total_count);
+                        out.put(&format!(" {}/{}\n", test_count, total_count));
                         test_column = 0;
                     }
                     test_count += 1;
-                    println!("{} --- FAILED", name);
+                    out.line(&format!("{} --- FAILED", name));
                 }
                 _ => {
-                    print!("{}", if matches!(o, Outcome::Ok) { "." } else { "i" });
+                    out.put(&format!("{}", if matches!(o, Outcome::Ok) { "." } else { "i" }));
                     test_count += 1;
                     test_column += 1;
                     if test_column % QUIET_MODE_MAX_COLUMN == QUIET_MODE_MAX_COLUMN - 1 {
-                        print!(" {}/{}\n", test_count, total_count);
+                        out.put(&format!(" {}/{}\n", test_count, total_count));
                         test_column = 0;
                     }
                 }
             }
         } else {
-            println!("test {}{} ... {}", name, mode, word);
+            out.line(&format!("test {}{} ... {}", name, mode, word));
         }
-        let _ = crate::io::stdout().flush();
         match o {
             Outcome::Ok => passed += 1,
             Outcome::Ignored => ignored += 1,
@@ -286,7 +397,9 @@ fn run(t: &Tests) -> i32 {
     let mut running = 0usize;
     let mut done = 0usize;
     let n = descs.len();
+    let live: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
     let spawn = |i: usize, running: &mut usize| {
+        live.lock().unwrap().push(i);
         let d = descs.clone();
         let tx = tx.clone();
         let name = d[i].name.clone();
@@ -325,7 +438,24 @@ fn run(t: &Tests) -> i32 {
             };
             spawn(i, &mut running);
         }
-        let Ok((i, o)) = rx.recv() else { break };
+        let got = match opts.timeout {
+            None => rx.recv().ok(),
+            Some(limit) => match rx.recv_timeout(limit) {
+                Ok(x) => Some(x),
+                Err(_) => {
+                    // the daemon's limit: the tests still running are reported as failed and left
+                    for (k, d) in descs.iter().enumerate() {
+                        if live.lock().unwrap().contains(&k) {
+                            report(&d.name, d.should_panic != 0, Outcome::Failed(Some(format!("timed out after {} s without a result", limit.as_secs()))), &mut failures);
+                        }
+                    }
+                    TIMED_OUT.store(true, crate::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            },
+        };
+        let Some((i, o)) = got else { break };
+        live.lock().unwrap().retain(|&k| k != i);
         running -= 1;
         done += 1;
         report(&descs[i].name, descs[i].should_panic != 0, o, &mut failures);
@@ -333,25 +463,25 @@ fn run(t: &Tests) -> i32 {
     // (terse: the line of characters ends with the next section's leading newline)
     let ok = failures.is_empty();
     if !ok {
-        println!();
-        println!("failures:");
-        println!();
+        out.line("");
+        out.line(&format!("failures:"));
+        out.line("");
         for (name, m) in &failures {
             if let Some(m) = m {
-                println!("---- {} stdout ----", name);
-                println!("{}", m);
-                println!();
+                out.line(&format!("---- {} stdout ----", name));
+                out.line(&format!("{}", m));
+                out.line("");
             }
         }
-        println!();
-        println!("failures:");
+        out.line("");
+        out.line(&format!("failures:"));
         for (name, _) in &failures {
-            println!("    {}", name);
+            out.line(&format!("    {}", name));
         }
     }
     let secs = started.elapsed().as_secs_f64();
-    println!();
-    println!(
+    out.line("");
+    out.line(&format!(
         "test result: {}. {} passed; {} failed; {} ignored; 0 measured; {} filtered out; finished in {:.2}s",
         if ok { "ok" } else { "FAILED" },
         passed,
@@ -359,8 +489,7 @@ fn run(t: &Tests) -> i32 {
         ignored,
         filtered_out,
         secs
-    );
-    println!();
-    let _ = crate::io::stdout().flush();
+    ));
+    out.line("");
     if ok { 0 } else { 101 }
 }
