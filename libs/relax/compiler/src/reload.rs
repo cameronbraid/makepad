@@ -1129,7 +1129,8 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
     let mut removed_uses: Vec<u32> = Vec::new();
     // (M13: a `use` and an inline `mod` with its items may be added -- their imports resolve
     // incrementally, apply_locked)
-    let addable = |pf: &crate::parser::ParsedFile, k: &ItemKind| matches!(k, ItemKind::Fn(sig, _, _) if pf.ast.fn_sig(*sig).lazy_body.is_some()) || matches!(k, ItemKind::Fn(_, Some(_), _) | ItemKind::Const(..) | ItemKind::Static(..) | ItemKind::Struct(..) | ItemKind::Enum(..) | ItemKind::Union(..) | ItemKind::TypeAlias { .. } | ItemKind::Impl { .. } | ItemKind::Use { .. } | ItemKind::Mod(Some(_)));
+    // (a file module, `mod foo;`, loads its file as it would at boot: Program::add_items)
+    let addable = |pf: &crate::parser::ParsedFile, k: &ItemKind| matches!(k, ItemKind::Fn(sig, _, _) if pf.ast.fn_sig(*sig).lazy_body.is_some()) || matches!(k, ItemKind::Fn(_, Some(_), _) | ItemKind::Const(..) | ItemKind::Static(..) | ItemKind::Struct(..) | ItemKind::Enum(..) | ItemKind::Union(..) | ItemKind::TypeAlias { .. } | ItemKind::Impl { .. } | ItemKind::Use { .. } | ItemKind::Mod(_));
     let inherent_impl = |pf: &crate::parser::ParsedFile, i: u32| matches!(&pf.ast.items[i as usize].kind, ItemKind::Impl(r) if pf.ast.row(*r).trait_.is_none());
     // an item in a body (`use` in a fn or closure body, a nested fn): part of the edit of the
     // paired item whose body holds it -- its body is checked again, and its blocks' items get
@@ -1190,7 +1191,9 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                 continue;
             }
         }
+        // (removing a file module, `mod foo;`, would leave its file's items behind: restart)
         let ok = oreached[i as usize]
+            && !matches!(it.kind, ItemKind::Mod(None))
             && match op[i as usize] {
                 None => addable(old, &it.kind) && !matches!(it.kind, ItemKind::Impl { .. }),
                 Some(p) => match &oa.items[p as usize].kind {
@@ -2132,6 +2135,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
     let u = &mut *up;
+    // (files beyond these and the edits' new versions are module files an added `mod` loaded)
+    let files0 = u.prog.files.len();
     let olds: Vec<u32> = edits.iter().map(|e| e.file).collect();
     u.flush_cache_records();
     note_edited_crates(u, &olds);
@@ -3553,6 +3558,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     out.files = olds.iter().map(|o| news.iter().find(|(x, _)| x == o).map_or(*o, |(_, n)| *n)).collect();
+    // a module file loaded now is watched from the next round on (the watcher re-reads its files
+    // when the load count moves)
+    if u.prog.files.len() > files0 + news.len() {
+        jit::DEFERRED_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        watch_kick();
+    }
     out.undo = Some(Undo { group: gen, versions: news.clone(), pairs: news_pairs.clone(), added: added_defs.clone(), removed: removed_defs.clone(), consts: saved_consts, consts_hit: consts_hit.clone(), adts: saved_adts, variants: saved_variants, const_failed: saved_failed, full_inputs, scope: scope.clone() });
     out.rung = Rung::Patch;
     if let Some(fv_cx) = fv_cx { fv_session_keep(transaction, fv_cx); }

@@ -2328,9 +2328,13 @@ impl Program {
         }
         let first = self.defs.len();
         for &(iid, at) in items {
-            match at {
-                Ok(module) => self.collect_items(file, &[iid], module, "", false)?,
-                Err(imp) => {
+            let added = match at {
+                // (a `mod foo;` finds its file from the module's directory, as at load)
+                Ok(module) => {
+                    let (dir, mod_rs) = self.mod_dirs.get(&module).cloned().unwrap_or_default();
+                    self.collect_items(file, &[iid], module, &dir, mod_rs)
+                }
+                Err(imp) => (|| {
                     let krate = self.defs[imp.0 as usize].krate;
                     let module = self.defs[imp.0 as usize].scope;
                     if let Some(ad) = self.collect_assoc(file, iid, imp, krate, module)? {
@@ -2339,7 +2343,15 @@ impl Program {
                         self.collect_body_items(file, iid, module, Some(ad))?;
                         crate::def_collector::collect_definitions(self, ad)?;
                     }
-                }
+                    Ok(())
+                })(),
+            };
+            if let Err(e) = added {
+                // the definitions made before the failure are no names (the caller rolls back
+                // only what this returns)
+                let made: Vec<DefId> = (first as u32..self.defs.len() as u32).map(DefId).collect();
+                self.unbind_defs(&made);
+                return Err(e);
             }
         }
         if self.imports_done {
