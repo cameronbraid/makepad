@@ -2773,6 +2773,11 @@ fn tvars_of(nodes: &[TNode], out: &mut Vec<String>) {
 impl<'a> Parser<'a> {
     fn mtok_eq(&self, i: usize, m: &MTok) -> bool {
         let t = self.toks.at(i);
+        // rustc_expand mbe/macro_parser: an interpolated nonterminal is
+        // opaque to literal tokens, even after it is recaptured as `tt`.
+        if self.frag_groups.contains_key(&{ t.lo }) {
+            return false;
+        }
         if t.kind != m.kind {
             return false;
         }
