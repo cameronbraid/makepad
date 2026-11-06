@@ -557,10 +557,11 @@ fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir:
             if !deps.contains(&edge) { deps.push(edge); }
         }
     }
+    let mut helper_macros = std::collections::HashMap::new();
     for &i in &fresh {
         let u = reg.units[map[i]].clone();
         if u.proc_macro {
-            scan_entries(sess, &mut reg, map[i], &u.src_path, u.edition);
+            scan_entries(sess, &mut reg, map[i], &u.src_path, u.edition, &mut helper_macros);
         }
     }
     if trace() {
@@ -665,10 +666,11 @@ pub fn set_build_outputs(sess: &std::sync::Arc<crate::Session>, units: &[CrateUn
                 }
             }
         }
+        let mut helper_macros = std::collections::HashMap::new();
         for (ui, src_path, edition) in rescan {
             reg.derives.retain(|(_, e)| e.unit != ui);
             reg.macros.retain(|(_, e)| e.unit != ui);
-            scan_entries(sess, reg, ui, &src_path, edition);
+            scan_entries(sess, reg, ui, &src_path, edition, &mut helper_macros);
         }
     });
 }
@@ -906,7 +908,9 @@ fn register_attrs(reg: &mut Reg, unit: usize, fname: &str, src: crate::cfg::Src<
 /// `#[proc_macro_derive(Name, ..)]` / `#[proc_macro]` / `#[proc_macro_attribute]` fns of a
 /// proc-macro crate (token scan of its files, following `mod x;` and expanding top-level
 /// `macro_rules!` invocations that generate proc-macro entry points).
-fn scan_entries(sess: &std::sync::Arc<crate::Session>, reg: &mut Reg, unit: usize, root: &str, edition: u16) {
+fn scan_entries(sess: &std::sync::Arc<crate::Session>, reg: &mut Reg, unit: usize, root: &str, edition: u16,
+    helper_macros: &mut std::collections::HashMap<usize, Vec<crate::macros::MacroDef>>,
+) {
     crate::why::edge(root, crate::why::Cause::new(root, 1, "proc-macro-index", "scan_entries"));
     let u = &reg.units[unit];
     let mut cfg = crate::cfg::CfgSet::machine(sess, &u.features);
@@ -919,11 +923,17 @@ fn scan_entries(sess: &std::sync::Arc<crate::Session>, reg: &mut Reg, unit: usiz
     for (dep_idx, _) in deps {
         if let Some(dep_u) = reg.units.get(dep_idx) {
             if !dep_u.proc_macro {
-                let mut dep_cfg = crate::cfg::CfgSet::machine(sess, &dep_u.features);
-                dep_cfg.set.push("relax".to_string());
-                for c in &dep_u.cfgs { dep_cfg.set.push(c.replace('"', "")); }
-                local_defs.extend(crate::preload::macro_rules_for_crate(&dep_u.src_path, &dep_u.name, dep_u.edition, &dep_cfg)
-                    .into_iter().filter(|d| d.exported));
+                // Many proc-macro crates share helpers such as syn. Scan each host unit
+                // once per registration pass, preserving dependency order. This map dies
+                // before any subsequent source, feature or build-output update.
+                let defs = helper_macros.entry(dep_idx).or_insert_with(|| {
+                    let mut dep_cfg = crate::cfg::CfgSet::machine(sess, &dep_u.features);
+                    dep_cfg.set.push("relax".to_string());
+                    for c in &dep_u.cfgs { dep_cfg.set.push(c.replace('"', "")); }
+                    crate::preload::macro_rules_for_crate(&dep_u.src_path, &dep_u.name, dep_u.edition, &dep_cfg)
+                        .into_iter().filter(|d| d.exported).collect()
+                });
+                local_defs.extend(defs.iter().cloned());
             }
         }
     }
