@@ -1530,12 +1530,6 @@ fn optimize_tree_panicked(up: *mut Unit, id: u32, p: Box<dyn std::any::Any + Sen
     (id, Err(format!("optimize_tree panicked: {}", msg)))
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-extern "C" {
-    #[link_name = "pthread_atfork"]
-    fn host_pthread_atfork(prepare: Option<unsafe extern "C" fn()>, parent: Option<unsafe extern "C" fn()>, child: Option<unsafe extern "C" fn()>) -> i32;
-}
-
 /// fork() in a program run by Relax: the child has only the forking thread, and may go on
 /// running JIT code (a lazy compile in the child). The loader hands programs its own `fork`
 /// (loader_symbol): before the fork every compile job finishes or waits at its start, and the
@@ -1551,25 +1545,96 @@ extern "C" {
 /// app not yet running hung at 'compiling: build scripts' on a cold cache).
 #[cfg(unix)]
 extern "C" fn relax_fork() -> i32 {
+    atfork_prepare();
     fork_prepare();
     let pid = os::thread::fork();
     let err = os::proc::last_error();
     if pid == 0 {
         fork_child();
+        atfork_child();
     } else {
         fork_parent();
+        atfork_parent();
     }
     os::proc::set_last_error(err);
     pid
 }
 
+/// The program's pthread_atfork handlers, (prepare, parent, child) addresses, in registration
+/// order. Lock-free: the child reads them, and a lock another thread held at the fork stays held.
+#[cfg(unix)]
+static ATFORK: [[std::sync::atomic::AtomicUsize; 3]; 64] = [const { [const { std::sync::atomic::AtomicUsize::new(0) }, const { std::sync::atomic::AtomicUsize::new(0) }, const { std::sync::atomic::AtomicUsize::new(0) }] }; 64];
+#[cfg(unix)]
+static ATFORK_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `pthread_atfork` in a program run by Relax: the handlers are built now, on the registering
+/// thread, and run by relax_fork / relax_fork_exec around the fork, as POSIX orders them
+/// (prepare in reverse registration order before the compiler parks; parent and child in
+/// registration order after it). ENOMEM past 64 registrations.
+#[cfg(unix)]
+extern "C" fn relax_pthread_atfork(prepare: usize, parent: usize, child: usize) -> i32 {
+    for h in [prepare, parent, child] {
+        if h != 0 {
+            relax_precompile(h as u64);
+        }
+    }
+    let k = ATFORK_LEN.load(Ordering::Acquire);
+    if k >= ATFORK.len() {
+        return 12;
+    }
+    for (slot, h) in ATFORK[k].iter().zip([prepare, parent, child]) {
+        slot.store(h, Ordering::Relaxed);
+    }
+    ATFORK_LEN.store(k + 1, Ordering::Release);
+    0
+}
+
+#[cfg(unix)]
+fn atfork_run(which: usize, reverse: bool) {
+    let n = ATFORK_LEN.load(Ordering::Acquire);
+    let mut run = |k: usize| {
+        let h = ATFORK[k][which].load(Ordering::Relaxed);
+        if h != 0 {
+            let f: unsafe extern "C" fn() = unsafe { std::mem::transmute(h) };
+            unsafe { f() };
+        }
+    };
+    if reverse { (0..n).rev().for_each(&mut run) } else { (0..n).for_each(&mut run) }
+}
+
+#[cfg(unix)]
+pub(crate) fn atfork_prepare() {
+    atfork_run(0, true);
+}
+#[cfg(unix)]
+pub(crate) fn atfork_parent() {
+    atfork_run(1, false);
+}
+#[cfg(unix)]
+pub(crate) fn atfork_child() {
+    atfork_run(2, false);
+}
+
+/// MAKEPAD_RUN_FORK_TRACE: each stage of a fork for an exec on stderr, with its time.
+#[cfg(unix)]
+pub(crate) fn fork_trace(stage: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_FORK_TRACE").is_some()) {
+        eprintln!("makepad fork: {stage} (thread {}, t={:.3} s)", os::thread::current(), crate::clock::ms_since_start() as f64 / 1000.0);
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn fork_prepare() {
+    fork_trace("prepare: pausing compile jobs");
     pause_compile_jobs(false);
+    fork_trace("prepare: parking the owner");
     owner::fork_prepare();
+    fork_trace("prepare: owner parked");
     // (every code writer paused: the child's copy of the W^X code views is consistent)
     #[cfg(any(target_os = "linux", target_os = "android"))]
     os::mem::fork_prepare();
+    fork_trace("prepare: done");
 }
 
 #[cfg(unix)]
@@ -1608,6 +1673,15 @@ pub(crate) fn fork_child() {
 }
 
 
+#[cfg(unix)]
+struct DropTrace(&'static str);
+#[cfg(unix)]
+impl Drop for DropTrace {
+    fn drop(&mut self) {
+        fork_trace(self.0);
+    }
+}
+
 /// Most functions one `__relax_precompile` builds (a pre_exec closure reaching a large library
 /// stops there; the rest compiles in the parent on first use, and a forked child that reaches
 /// it ends with its name: forkexec.rs).
@@ -1620,6 +1694,8 @@ const FORK_PRECOMPILE_MAX: usize = 4096;
 /// built. A forked child runs only code built before the fork (forkexec.rs).
 #[cfg(unix)]
 pub(crate) extern "C" fn relax_precompile(addr: u64) -> u64 {
+    fork_trace("precompile: start");
+    let _end = DropTrace("precompile: end");
     crate::jit::host_boundary("relax_precompile", move || {
         let _keep = os::proc::KeepLastError::new();
         let up = cur_unit();
@@ -20660,8 +20736,12 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         // glibc keeps pthread_atfork in libc_nonshared.a (a static wrapper of __register_atfork that
         // every C program links): dlsym never finds it, so the loader's own linked copy answers
         // (rand 0.8's ReseedingRng registers its fork handler at its first use)
+        // The program's handlers are kept here rather than in libc's list: libc would call them
+        // inside the fork, after fork_prepare parked the compiler, and a handler not built yet
+        // waited for it for good (a Pages test daemon hung in its first fork after a
+        // cookie::Key::generate). relax_fork runs them around the fork instead.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        b"pthread_atfork" => Some(host_pthread_atfork as *const () as usize),
+        b"pthread_atfork" => Some(relax_pthread_atfork as *const () as usize),
         // (glibc's atexit is there too; and a handler in libc's list would run after this thread's
         // locals are gone, where a lazy compile of it cannot run: makepad-remote's socket cleanup)
         #[cfg(unix)]

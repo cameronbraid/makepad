@@ -72,17 +72,23 @@ pub(crate) extern "C" fn relax_fork_exec() -> i32 {
         t[k][3].store(STATE_FORKING, Ordering::Release);
     }
     ENTRY.with(|e| e.set(k.unwrap_or(usize::MAX)));
+    crate::jit::atfork_prepare();
     crate::jit::fork_prepare();
     let pid = crate::os::thread::fork();
     let err = crate::os::proc::last_error();
+    if pid != 0 {
+        crate::jit::fork_trace("forked");
+    }
     if pid == 0 {
         EXEC_CHILD.store(true, Ordering::SeqCst);
         crate::jit::fork_child();
+        crate::jit::atfork_child();
         if let (Some(t), Some(k)) = (t, k) {
             t[k][3].store(STATE_CHILD, Ordering::Release);
         }
     } else {
         crate::jit::fork_parent();
+        crate::jit::atfork_parent();
         if let (Some(t), Some(k)) = (t, k) {
             t[k][0].store(if pid > 0 { pid as u64 } else { 0 }, Ordering::Release);
         }
