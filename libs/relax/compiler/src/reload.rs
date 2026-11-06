@@ -1712,6 +1712,54 @@ fn referenced_slots(relocs: &[relax_backend::rir::RelocAt], out: &mut Vec<u32>) 
 
 type Code = (Vec<u8>, Vec<(u32, u64)>, Vec<relax_backend::rir::RelocAt>);
 
+fn async_signature(u: &Unit, d: DefId) -> Option<Vec<Vec<u8>>> {
+    let d = u.prog.def(d);
+    let pf = &u.prog.files[d.file as usize];
+    let item = pf.ast.item(d.item);
+    let crate::ast::ItemKind::Fn(sig, body, _) = &item.kind else { return None };
+    let sig = pf.ast.fn_sig(*sig);
+    if !sig.asyncness { return None; }
+    let end = body.map(|b| pf.ast.block(b).lo)
+        .or_else(|| sig.lazy_body.map(|r| pf.tok(r.lo - 1).lo))?;
+    Some(toks_norm(pf, item.lo, end, &[]))
+}
+
+// A function item has no stored bytes or drop state. Its replacement can be
+// captured by a retained factory without replacing any future the factory made.
+fn factory_capture_eq(u: &Unit, a: TyId, b: TyId) -> bool {
+    if a == b { return true; }
+    match (u.tcx.tys.kind(a), u.tcx.tys.kind(b)) {
+        (crate::types::TyKind::FnDef(ad, aa, ar), crate::types::TyKind::FnDef(bd, ba, br)) => {
+            aa == ba && ar == br && u.prog.def_path(*ad) == u.prog.def_path(*bd)
+                && async_signature(u, *ad).is_some()
+                && async_signature(u, *ad) == async_signature(u, *bd)
+                && {
+                    let output = |d| {
+                        u.tcx.fn_sig(&u.prog, d)?;
+                        let ty = u.tcx.async_fns.get(&d)?;
+                        let ty = u.tcx.normalize_erasing_regions(&u.prog,
+                            crate::tcx::TypingEnv::fully_monomorphized(&u.prog),
+                            u.tcx.tys.subst_erasing_regions(ty, u.tcx.tys.list(*aa)));
+                        (ty != u.tcx.tys.error).then_some(ty)
+                    };
+                    output(*ad).is_some() && output(*ad) == output(*bd)
+                }
+        }
+        _ => false,
+    }
+}
+
+fn factory_owner_eq(u: &Unit, a: TyId, b: TyId) -> bool {
+    if a == b { return true; }
+    match (u.tcx.tys.kind(a), u.tcx.tys.kind(b)) {
+        (crate::types::TyKind::FnDef(ad, aa, ar), crate::types::TyKind::FnDef(bd, ba, br)) => {
+            ad == bd && ar == br && u.tcx.tys.list(*aa).len() == u.tcx.tys.list(*ba).len()
+                && u.tcx.tys.list(*aa).iter().zip(u.tcx.tys.list(*ba)).all(|(&a, &b)| factory_capture_eq(u, a, b))
+        }
+        _ => false,
+    }
+}
+
 /// A closure's identity across versions of its parent: its ordinal among the closure
 /// expressions of the parent's item (source order), with its signature, captures and owner
 /// types. Coroutines (async blocks and bodies) are not matched: their suspended states keep
@@ -3034,6 +3082,80 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // place with the same signature and captures (same environment layout); otherwise it keeps
     // its own code (memory-safe; reported)
     let mut rebind: Vec<(u32, u32)> = Vec::new();
+    // Refresh generic factories such as Handler::call for a replaced async fn item.
+    // Their public output must retain its exact type: a concrete old future must
+    // never be filled with a new future merely because their layouts happen to match.
+    let mut factories = Vec::new();
+    if errs.is_empty() && !removed_defs.is_empty() {
+        let u = &*up;
+        let candidates: Vec<_> = u.fns.iter().enumerate().take(n0).filter_map(|(id, f)| {
+            if !f.compiled { return None; }
+            let FnKey::Inst(d, args) = &f.key else { return None };
+            let mut next = args.clone();
+            let mut futures = Vec::new();
+            let mut coroutine_owners = Vec::new();
+            for ty in &mut next {
+                let crate::types::TyKind::FnDef(old, a, r) = u.tcx.tys.kind(*ty) else { continue };
+                let sig = async_signature(u, *old)?;
+                if let Some(new) = added_defs.iter().copied().find(|&new| u.prog.def_path(new) == u.prog.def_path(*old)
+                    && async_signature(u, new).as_ref() == Some(&sig)) {
+                    let replacement = u.tcx.tys.intern(crate::types::TyKind::FnDef(new, *a, *r));
+                    if factory_capture_eq(u, *ty, replacement) {
+                        let ret = |d| {
+                            let sig = u.tcx.fn_sig(&u.prog, d)?;
+                            Some(u.tcx.tys.subst_erasing_regions(sig.ret, u.tcx.tys.list(*a)))
+                        };
+                        if let Some((old, new)) = ret(*old).zip(ret(new)) {
+                            futures.push((old, new));
+                            let norm = |ty| u.tcx.normalize_erasing_regions(&u.prog,
+                                crate::tcx::TypingEnv::fully_monomorphized(&u.prog), ty);
+                            let (old, new) = (norm(old), norm(new));
+                            if old != u.tcx.tys.error && new != u.tcx.tys.error { futures.push((old, new)); }
+                            if new != u.tcx.tys.error { coroutine_owners.push((replacement, new)); }
+                        }
+                        *ty = replacement;
+                    }
+                }
+            }
+            if next == *args { return None; }
+            for ty in &mut next {
+                if let Some((_, new)) = futures.iter().find(|(old, _)| ty == old) {
+                    *ty = *new;
+                } else if let crate::types::TyKind::Closure(_, ce, caps) = u.tcx.tys.kind(*ty) {
+                    // Signature edits may retire an old opaque's normalization.
+                    // The concrete coroutine still names the fn item that made it.
+                    if ce & crate::tcx::ASYNC_FN_BODY != 0 {
+                        if let Some((_, future)) = coroutine_owners.iter().find(|(owner, _)| factory_capture_eq(u, caps.parent_args, *owner)) {
+                            *ty = *future;
+                        }
+                    }
+                }
+            }
+            let sig = u.tcx.fn_sig(&u.prog, *d)?;
+            let norm = |ty, args: &[TyId]| u.tcx.normalize_erasing_regions(&u.prog,
+                crate::tcx::TypingEnv::fully_monomorphized(&u.prog), u.tcx.tys.subst_erasing_regions(ty, args));
+            let (old_ret, new_ret) = (norm(sig.ret, args), norm(sig.ret, &next));
+            if old_ret == u.tcx.tys.error || new_ret == u.tcx.tys.error || old_ret != new_ret
+                || !sig.params.iter().all(|&p| {
+                    let (a, b) = (norm(p, args), norm(p, &next));
+                    a != u.tcx.tys.error && b != u.tcx.tys.error && factory_capture_eq(u, a, b)
+                }) {
+                return None;
+            }
+            Some((id as u32, *d, next))
+        }).collect();
+        for (old, d, args) in candidates {
+            let new = (&*up).fn_id(FnKey::Inst(d, args));
+            match compile_guarded(up, new) {
+                Ok(code) => {
+                    pre.push((new, Ok(code)));
+                    rebind.push((old, new));
+                    factories.push((old, new));
+                }
+                Err(e) => errs.push(format!("retained factory {}: {}", (&*up).fns[old as usize].name, e)),
+            }
+        }
+    }
     if errs.is_empty() {
         let u = &*up;
         let rebuilt: Vec<u32> = slots.iter().chain(fresh.iter()).copied().collect();
@@ -3048,6 +3170,10 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 else if f.compiled { olds_c.push(id); }
             }
         }
+        for &(old, new) in &factories {
+            olds_c.extend(u.closures_of_slots([old]).into_iter().filter(|&id| u.fns[id as usize].compiled));
+            news_c.extend(u.closures_of_slots([new]));
+        }
         let new_ids: Vec<(u32, Option<(u32, TyId, Vec<TyId>, TyId)>)> = news_c.iter().map(|&n| (n, closure_ident(u, n))).collect();
         for o in olds_c {
             let oi = closure_ident(u, o);
@@ -3056,10 +3182,15 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 _ => continue,
             };
             let hit = new_ids.iter().find(|(n, ni)| {
-                matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent) && ni.is_some() && *ni == oi
+                matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent || factories.contains(&(parent, *p)))
+                    && ni.as_ref().zip(oi.as_ref()).is_some_and(|(n, o)| n.0 == o.0 && n.1 == o.1
+                        && n.2.len() == o.2.len() && n.2.iter().zip(&o.2).all(|(&a, &b)| factory_capture_eq(u, a, b))
+                        && factory_owner_eq(u, n.3, o.3))
             });
             match hit {
-                Some((n, _)) => rebind.push((o, *n)),
+                Some((n, _)) => {
+                    rebind.push((o, *n));
+                }
                 None => {
                     if oi.is_some() && new_ids.iter().any(|(n, ni)| matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent) && ni.as_ref().map(|x| x.0) == oi.as_ref().map(|x| x.0)) {
                         out.lines.push(format!("kept: stored values of closure {} keep its old code (its captures or signature changed)", u.fns[o as usize].name));
@@ -3080,26 +3211,15 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         // constructors so their poll bodies participate in compatibility checks.
         let replacements: Vec<(DefId, Vec<TyId>)> = {
             let u = &*up;
-            let signature = |d: DefId| -> Option<Vec<Vec<u8>>> {
-                let d = u.prog.def(d);
-                let pf = &u.prog.files[d.file as usize];
-                let item = pf.ast.item(d.item);
-                let crate::ast::ItemKind::Fn(sig, body, _) = &item.kind else { return None };
-                let sig = pf.ast.fn_sig(*sig);
-                if !sig.asyncness { return None; }
-                let end = body.map(|b| pf.ast.block(b).lo)
-                    .or_else(|| sig.lazy_body.map(|r| pf.tok(r.lo - 1).lo))?;
-                Some(toks_norm(pf, item.lo, end, &[]))
-            };
             u.slots_of_defs(removed_defs.iter().copied()).into_iter().filter_map(|id| {
                 let FnKey::Inst(old, args) = &u.fns[id as usize].key else { return None };
                 if !u.closures_of_slots([id]).iter().any(|&c| u.fns[c as usize].compiled
                     && matches!(u.fns[c as usize].key, FnKey::Closure(_, ce, _) if ce & crate::tcx::ASYNC_FN_BODY != 0)) {
                     return None;
                 }
-                let sig = signature(*old)?;
+                let sig = async_signature(u, *old)?;
                 added_defs.iter().copied().find(|&d| u.prog.def_path(d) == u.prog.def_path(*old)
-                    && signature(d).as_ref() == Some(&sig)).map(|d| (d, args.clone()))
+                    && async_signature(u, d).as_ref() == Some(&sig)).map(|d| (d, args.clone()))
             }).collect()
         };
         for (d, args) in replacements {
