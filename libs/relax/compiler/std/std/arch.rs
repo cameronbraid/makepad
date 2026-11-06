@@ -334,6 +334,10 @@ macro_rules! is_x86_feature_detected {
     ("avx512bitalg") => { cfg!(target_feature = "avx512bitalg") || $crate::arch::detect::check($crate::arch::detect::Feature::Avx512bitalg) };
     ("avx512vpopcntdq") => { cfg!(target_feature = "avx512vpopcntdq") || $crate::arch::detect::check($crate::arch::detect::Feature::Avx512vpopcntdq) };
     ("avxvnni") => { cfg!(target_feature = "avxvnni") || $crate::arch::detect::check($crate::arch::detect::Feature::Avxvnni) };
+    // Deprecated std_detect spellings remain aliases for existing callers.
+    ("avx512gfni") => { $crate::is_x86_feature_detected!("gfni") };
+    ("avx512vaes") => { $crate::is_x86_feature_detected!("vaes") };
+    ("avx512vpclmulqdq") => { $crate::is_x86_feature_detected!("vpclmulqdq") };
     ($t:tt,) => { $crate::is_x86_feature_detected!($t) };
     ($t:tt) => { compile_error!(concat!("unknown x86 target feature: ", $t)) };
 }
