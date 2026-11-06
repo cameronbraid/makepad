@@ -5567,7 +5567,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         // sp = fp - frame in the body
         let spill = |o: i32| -(saved as i32 + o);
         let slot = |s: u32| (slot_off[s as usize] - fsz) as i32;
-        let fr = crate::dbgloc::Frame { callee_int: &cfg.int_callee, callee_flt: &cfg.flt_callee, arg_regs: &[0, 1, 2, 3, 4, 5, 6, 7], captured: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], call_writes: &[S0, S1, IP0, IP1], spill_fp: &spill, slot_fp: &slot };
+        let fr = crate::dbgloc::Frame { callee_int: &cfg.int_callee, callee_flt: &cfg.flt_callee, arg_regs: &[0, 1, 2, 3, 4, 5, 6, 7], captured: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], call_writes: &[S0, S1, IP0, IP1], spill_fp: &spill, slot_fp: &slot, slot_base_fp: None };
         let vars = crate::dbgloc::build(g.f, &g.al, &fr, &g.var_calls);
         let e = crate::dbgloc::pc_entries(&vars, g.f.file);
         crate::dbgloc::note_stats(&pc_map, &e, vars.len());

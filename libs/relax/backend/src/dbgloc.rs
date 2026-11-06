@@ -142,6 +142,8 @@ pub struct Frame<'a> {
     pub call_writes: &'a [u8],
     pub spill_fp: &'a dyn Fn(i32) -> i32,
     pub slot_fp: &'a dyn Fn(u32) -> i32,
+    /// When slots have a dynamic base, the frame cell holding that base pointer.
+    pub slot_base_fp: Option<i32>,
 }
 
 /// Builds the table of `f` (after allocation `al`) for the calls the emitter placed: `calls`
@@ -548,6 +550,24 @@ pub fn build(f: &Func, al: &Alloc, fr: &Frame, calls: &[(u32, u32)]) -> Vec<u8> 
     for (_, row) in table.sites.iter_mut() {
         for r in row.iter_mut() {
             r.0 = renum[r.0 as usize];
+        }
+    }
+    if let Some(base) = fr.slot_base_fp {
+        let mut slots = Vec::new();
+        for (vi, var) in table.vars.iter_mut().enumerate() {
+            if let VarKind::Frame(off) = var.kind {
+                var.kind = VarKind::Mem(off);
+                slots.push((vi as u32, 0, Home::Fp(base)));
+            }
+        }
+        if !slots.is_empty() {
+            for &(_, ret) in calls {
+                match table.sites.iter_mut().find(|s| s.0 == ret) {
+                    Some((_, row)) => row.extend_from_slice(&slots),
+                    None => table.sites.push((ret, slots.clone())),
+                }
+            }
+            table.sites.sort_unstable_by_key(|s| s.0);
         }
     }
     if table.vars.is_empty() {

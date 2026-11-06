@@ -1033,6 +1033,8 @@ struct Gen<'a> {
     /// rbp offset base for spills/slots: [rbp - (saved + x)]
     saved: i32,
     slot_off: Vec<i32>,
+    /// An rbp-relative cell holding the aligned slot base; zero for ordinary frames.
+    slot_base: i32,
     /// per value: its frame position when it is a slot address (frame::slot_addr_positions)
     slot_pos: Vec<i64>,
     block_pos: Vec<usize>,
@@ -1208,6 +1210,16 @@ impl<'a> Gen<'a> {
         -(self.saved + off)
     }
 
+    fn slot_addr(&mut self, r: u8, s: u32) {
+        let off = -(self.saved + self.slot_off[s as usize]);
+        if self.slot_base != 0 {
+            self.a.load64(r, RBP, self.slot_base);
+            self.a.lea(r, r, off);
+        } else {
+            self.a.lea(r, RBP, off);
+        }
+    }
+
     /// rbp displacement of a scalar float value that lives in its spill slot
     fn spill_of(&self, v: VReg) -> Option<i32> {
         match self.al.loc[v.0 as usize] {
@@ -1300,10 +1312,7 @@ impl<'a> Gen<'a> {
     fn remat_kind_into(&mut self, r: u8, k: Remat) {
         match k {
             Remat::Const(k) => self.a.mov_ri_nf(r, k),
-            Remat::Slot(s) => {
-                let off = self.slot_off[s as usize];
-                self.a.lea(r, RBP, -(self.saved + off));
-            }
+            Remat::Slot(s) => self.slot_addr(r, s),
             // mov r, [rip + pool] leaves the flags alone
             Remat::Addr(a) => self.mov_reloc(r, Reloc::Sym(a)),
             Remat::FnAddr(id) => self.mov_reloc(r, Reloc::Thunk(id)),
@@ -1319,6 +1328,10 @@ impl<'a> Gen<'a> {
         match (self.al.loc[base.0 as usize], self.al.remat[base.0 as usize]) {
             (Loc::None, Remat::Slot(s)) => {
                 let so = self.slot_off[s as usize];
+                if self.slot_base != 0 {
+                    self.a.load64(scratch, RBP, self.slot_base);
+                    return (scratch, off - (self.saved + so));
+                }
                 return (RBP, off - (self.saved + so));
             }
             // base + k without a register: k folds into the displacement
@@ -1540,13 +1553,22 @@ impl<'a> Gen<'a> {
         self.saved = 8 * self.al.used_callee_int.len() as i32;
         // only slots something addresses take space; slots whose lifetimes cannot overlap share
         // it (frame::slot_layout)
-        // (the layout counts from the frame's base, 16-aligned, so a slot's alignment holds there:
-        // the saves come first and may be an odd number of words)
+        // Rbp is only 16-aligned. Slots needing more use a separately aligned base,
+        // retaining the ordinary rbp chain, spills, saved registers and incoming arguments.
+        let used = crate::rir::used_slots(self.f);
+        let slot_align = self.f.slots.iter().zip(&used).filter(|(_, used)| **used).map(|(s, _)| s.align).max().unwrap_or(16).max(16);
         let (at, end) = crate::frame::slot_layout(self.f, (self.saved + self.al.spill_bytes as i32) as i64, !crate::stats::opt_off(options, "-slotcolor"));
         let at: Vec<i64> = at.iter().map(|&x| x - self.saved as i64).collect();
         self.slot_off.extend(at.iter().map(|&x| x as i32));
         self.slot_pos = crate::frame::slot_addr_positions(self.f, &at);
         let mut off = (end - self.saved as i64) as i32;
+        if slot_align > 16 {
+            // The base can move down by at most align - 16. Keep that space
+            // below the slots before placing any rbp-relative bookkeeping cells.
+            off += slot_align as i32 - 16;
+            off = (off + 7) / 8 * 8 + 8;
+            self.slot_base = -(self.saved + off);
+        }
         off = (off + 7) / 8 * 8;
         // C ABI body: buffers rebuilding aggregate params from registers, the result buffer
         if let Some(sig) = &self.f.cabi {
@@ -1626,6 +1648,14 @@ impl<'a> Gen<'a> {
         }
         self.stack_probe(frame);
         self.a.sub_rsp(frame as u32);
+        if self.slot_base != 0 {
+            self.a.mov_rr(R11, RBP);
+            self.a.rex(true, 0, 0, R11, false);
+            self.a.byte(0x81); // and r11, -align
+            self.a.modrm_rr(4, R11);
+            self.a.u32(-(slot_align as i32) as u32);
+            self.a.store64(RBP, self.slot_base, R11);
+        }
         if self.dom_read.first() == Some(&true) {
             self.dom_base();
         }
@@ -3787,8 +3817,7 @@ impl<'a> Gen<'a> {
             }
             Inst::SlotAddr(d, s) => {
                 let rd = self.def_i(*d, R10);
-                let off = self.slot_off[*s as usize];
-                self.a.lea(rd, RBP, -(self.saved + off));
+                self.slot_addr(rd, *s);
                 self.fin_i(*d, rd);
             }
             Inst::Addr(d, sym) => {
@@ -6670,6 +6699,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         al,
         saved: 0,
         slot_off: Vec::new(),
+        slot_base: 0,
         slot_pos: Vec::new(),
         block_pos: Vec::new(),
         fixups: Vec::new(),
@@ -6803,7 +6833,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         let (saved, slot_off) = (g.saved, &g.slot_off);
         let spill = |o: i32| -(saved + o);
         let slot = |s: u32| -(saved + slot_off[s as usize]);
-        let fr = crate::dbgloc::Frame { callee_int: &cfg.int_callee, callee_flt: &cfg.flt_callee, arg_regs: &[RDI, RSI, RDX, RCX, R8, R9], captured: &[RDI, RSI, RDX, RCX, R8, R9], call_writes: &[RAX, R10, R11], spill_fp: &spill, slot_fp: &slot };
+        let fr = crate::dbgloc::Frame { callee_int: &cfg.int_callee, callee_flt: &cfg.flt_callee, arg_regs: &[RDI, RSI, RDX, RCX, R8, R9], captured: &[RDI, RSI, RDX, RCX, R8, R9], call_writes: &[RAX, R10, R11], spill_fp: &spill, slot_fp: &slot, slot_base_fp: (g.slot_base != 0).then_some(g.slot_base) };
         let vars = crate::dbgloc::build(g.f, &g.al, &fr, &g.var_calls);
         let e = crate::dbgloc::pc_entries(&vars, g.f.file);
         crate::dbgloc::note_stats(&pc_map, &e, vars.len());
