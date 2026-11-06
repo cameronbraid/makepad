@@ -513,6 +513,104 @@ pub unsafe fn _mm256_cvtepi8_epi32(a: __m128i) -> __m256i {
     from256_i32(r)
 }
 
+pub unsafe fn _mm256_cvtepi16_epi32(a: __m128i) -> __m256i {
+    let a = lanes128_i16(a);
+    let mut r = [0i32; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a[i] as i32;
+        i += 1;
+    }
+    from256_i32(r)
+}
+
+pub unsafe fn _mm256_cvtepu16_epi32(a: __m128i) -> __m256i {
+    let a = lanes128_u16(a);
+    let mut r = [0i32; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a[i] as i32;
+        i += 1;
+    }
+    from256_i32(r)
+}
+
+pub unsafe fn _mm256_cvtepu8_epi32(a: __m128i) -> __m256i {
+    let a = lanes128_u8(a);
+    let mut r = [0i32; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a[i] as i32;
+        i += 1;
+    }
+    from256_i32(r)
+}
+
+pub unsafe fn _mm256_abs_epi16(a: __m256i) -> __m256i {
+    i_join(_mm_abs_epi16(i_lo(&a)), _mm_abs_epi16(i_hi(&a)))
+}
+
+pub unsafe fn _mm256_max_epi32(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_max_epi32(i_lo(&a), i_lo(&b)), _mm_max_epi32(i_hi(&a), i_hi(&b)))
+}
+
+pub unsafe fn _mm256_min_epi32(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_min_epi32(i_lo(&a), i_lo(&b)), _mm_min_epi32(i_hi(&a), i_hi(&b)))
+}
+
+pub unsafe fn _mm256_srav_epi32(a: __m256i, count: __m256i) -> __m256i {
+    let a = lanes256_i32(a);
+    let count = lanes256_i32(count);
+    let mut r = [0i32; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a[i] >> (count[i] as u32).min(31);
+        i += 1;
+    }
+    from256_i32(r)
+}
+
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub unsafe fn _mm256_insert_epi32<const INDEX: i32>(a: __m256i, value: i32) -> __m256i {
+    const { assert!(INDEX >= 0 && INDEX < 8) };
+    let mut a = lanes256_i32(a);
+    a[INDEX as usize] = value;
+    from256_i32(a)
+}
+
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub unsafe fn _mm256_i32gather_epi32<const SCALE: i32>(slice: *const i32, offsets: __m256i) -> __m256i {
+    const { assert!(SCALE == 1 || SCALE == 2 || SCALE == 4 || SCALE == 8) };
+    let offsets = lanes256_i32(offsets);
+    let mut r = [0i32; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = crate::ptr::read_unaligned((slice as *const u8).offset(offsets[i] as isize * SCALE as isize) as *const i32);
+        i += 1;
+    }
+    from256_i32(r)
+}
+
+pub unsafe fn _mm256_loadu2_m128i(hi: *const __m128i, lo: *const __m128i) -> __m256i {
+    i_join(_mm_loadu_si128(lo), _mm_loadu_si128(hi))
+}
+
+pub unsafe fn _mm256_store_si256(mem_addr: *mut __m256i, a: __m256i) {
+    crate::ptr::write(mem_addr, a);
+}
+
+pub unsafe fn _mm_sra_epi16(a: __m128i, count: __m128i) -> __m128i {
+    let a = lanes128_i16(a);
+    let count = (count.0[0] as u64).min(15) as u32;
+    let mut r = [0i16; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a[i] >> count;
+        i += 1;
+    }
+    from128_i16(r)
+}
+
 pub unsafe fn _mm256_movemask_epi8(a: __m256i) -> i32 {
     let a = lanes256_u8(a);
     let mut r = 0u32;
