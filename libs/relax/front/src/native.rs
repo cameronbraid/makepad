@@ -116,7 +116,15 @@ fn hash_dir(dir: &std::path::Path, h: &mut u64) {
             Ok(t) if t.is_dir() => hash_dir(&p, h),
             Ok(_) => {
                 if let Ok(d) = std::fs::read(&p) {
-                    *h = fnv(&d, *h);
+                    // Hash every byte on every launch, including build-script assets. FNV's
+                    // serial byte loop dominates large package trees; DefaultHasher consumes
+                    // words instead. Do not replace content reads with timestamp checks: edits
+                    // can preserve both file length and mtime.
+                    use std::hash::Hasher;
+                    let mut content = std::hash::DefaultHasher::new();
+                    content.write(&d);
+                    *h = fnv(&(d.len() as u64).to_le_bytes(), *h);
+                    *h = fnv(&content.finish().to_le_bytes(), *h);
                 }
             }
             Err(_) => {}
@@ -180,7 +188,7 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
     let flags: Vec<&String> = req.cargo_flags.iter().filter(|f| f.as_str() != "--release").collect();
 
     // ---- the key
-    let mut h = fnv(b"native-link-v9", 0xcbf29ce484222325);
+    let mut h = fnv(b"native-link-v10", 0xcbf29ce484222325);
     h = fnv(req.triple.as_bytes(), h);
     h = fnv(&selection_key(&script_pkgs, &lib_pkgs).to_le_bytes(), h);
     for f in &flags {
