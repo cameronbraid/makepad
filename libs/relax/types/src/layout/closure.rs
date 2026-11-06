@@ -8,6 +8,10 @@ use crate::types::{TyId, TyKind};
 pub struct ClosureStorage {
     pub fields: Vec<TyId>,
     pub roots: Vec<u32>,
+    /// A shared reference field reached through a borrowed root can outlive that root
+    /// (for example an iterator returned by `&self`). Store the reference itself,
+    /// and resolve body places from this prefix instead of retaining `&self`.
+    pub shared_prefixes: Vec<Option<Vec<(Projection, TyId)>>>,
     pub by_value: Vec<bool>,
     pub owned_paths: Vec<Option<Vec<Vec<u32>>>>,
     /// Per root: its field is a `&mut T` the closure only reads through (every capture is a
@@ -41,12 +45,34 @@ impl ClosureStorage {
             .filter(|root| captures.iter().any(|c| c.place.root == *root))
             .collect();
         let mut by_value = Vec::new();
+        let mut shared_prefixes = Vec::new();
         let mut shared_reborrow = Vec::new();
         let mut fields = Vec::new();
         let mut upvars = Vec::new();
         for &root in &roots {
             let cs: Vec<_> = captures.iter().filter(|c| c.place.root == root).collect();
-            let ty = ty(body.locals[root as usize].ty);
+            let root_ty = ty(body.locals[root as usize].ty);
+            // Only cross builtin reference/field projections. Every use must continue through the
+            // same reference field, so copying that pointer preserves shared identity
+            // without copying the containing value or extending a temporary borrow.
+            let shared_prefix = cs.first().and_then(|first| {
+                first.place.projections.iter().enumerate().rev().find_map(|(i, (p, _))| {
+                    if *p != Projection::Deref || i == 0
+                        || !matches!(first.place.projections[i - 1].0, Projection::Field(..))
+                        || !matches!(tcx.tys.kind(ty(first.place.before(i))), TyKind::Ref(false, ..))
+                        || !first.place.projections[..i].iter().enumerate().all(|(j, (p, _))| match p {
+                            Projection::Field(..) => true,
+                            Projection::Deref => matches!(tcx.tys.kind(ty(first.place.before(j))), TyKind::Ref(..)),
+                            _ => false,
+                        })
+                        || !cs.iter().all(|c| c.place.projections.starts_with(&first.place.projections[..=i]))
+                    { return None; }
+                    Some(first.place.projections[..i].iter().map(|(p, t)| (*p, ty(*t))).collect::<Vec<_>>())
+                })
+            });
+            let ty = shared_prefix.as_ref().and_then(|p| p.last().map(|p| p.1)).unwrap_or(root_ty);
+            let projected_shared = shared_prefix.is_some();
+            shared_prefixes.push(shared_prefix);
             // A captured *ref is already a pointer to its referent. The old
             // ABI accesses the root, so store that reference value, not &ref.
             let deref_shared = matches!(tcx.tys.kind(ty), TyKind::Ref(..))
@@ -56,7 +82,7 @@ impl ClosureStorage {
                         .first()
                         .is_some_and(|p| p.0 == Projection::Deref)
                 });
-            let value = deref_shared || cs.iter().any(|c| c.info.kind == crate::upvar::CaptureKind::ByValue);
+            let value = projected_shared || deref_shared || cs.iter().any(|c| c.info.kind == crate::upvar::CaptureKind::ByValue);
             let mutable = cs.iter().any(|c| {
                 matches!(
                     c.info.kind,
@@ -73,7 +99,7 @@ impl ClosureStorage {
             });
             let mut fs = Vec::new();
             let precise = value
-                && !deref_shared
+                && !deref_shared && !projected_shared
                 && cs.iter().filter(|c| c.info.kind == crate::upvar::CaptureKind::ByValue).all(|c| {
                     let path: Vec<_> = c.place.projections.iter().map_while(|(p, _)| {
                         if let Projection::Field(0, field) = p { Some(*field) } else { None }
@@ -100,6 +126,6 @@ impl ClosureStorage {
             upvars.push(tcx.tys.prim(if states <= 1 << 8 { crate::program::Prim::U8 }
                 else if states <= 1 << 16 { crate::program::Prim::U16 } else { crate::program::Prim::U32 }));
         }
-        Self { fields: upvars, roots, by_value, owned_paths: fields, shared_reborrow, drop_flags }
+        Self { fields: upvars, roots, shared_prefixes, by_value, owned_paths: fields, shared_reborrow, drop_flags }
     }
 }

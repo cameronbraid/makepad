@@ -228,6 +228,7 @@ pub struct Lcx<'a> {
     cur_fn: u32,
     pub b: &'a Body,
     closure_storage: HashMap<u32, crate::layout::ClosureStorage>,
+    shared_capture_places: Vec<(u32, Vec<relax_types::expr_use::Projection>, Place, TyId)>,
     pub f: Func,
     cur: u32,
     pos: u32,
@@ -493,6 +494,7 @@ impl<'a> Lcx<'a> {
         let d3 = if plain_calls || (cur_fn as usize) >= u.fns.len() { None } else { u.disjoint_checks(cur_fn) };
         Lcx {
             closure_storage,
+            shared_capture_places: Vec::new(),
             u,
             cur_fn,
             plain_calls,
@@ -2251,6 +2253,12 @@ impl<'a> Lcx<'a> {
             let once = self.u.tcx.tys.to_opt_closure_kind(ca.kind_ty()) == Some(relax_types::upvar::ClosureKind::FnOnce);
             for (i, li) in caps.iter().enumerate() {
                 let off = ul.fields.get(i).copied().unwrap_or(0) as i32;
+                if let Some(prefix) = self.storage_for_closure(ce).shared_prefixes[i].clone() {
+                    let ty = prefix.last().unwrap().1;
+                    let addr = self.addr_add(env, off);
+                    self.shared_capture_places.push((*li, prefix.iter().map(|p| p.0).collect(), Place::Mem(addr, 0), ty));
+                    continue;
+                }
                 if self.storage_for_closure(ce).drop_flags && self.capture_by_value(ce, i, *li) {
                     if let Some(&foff) = ul.fields.get(caps.len() + i) {
                         self.capture_flag.insert(*li, (env, foff as i32));
@@ -2343,6 +2351,11 @@ impl<'a> Lcx<'a> {
         let caps = self.storage_for_closure(ce).roots.clone();
         let mut vals = Vec::new();
         for (i, li) in caps.iter().enumerate() {
+            if let Some(prefix) = self.storage_for_closure(ce).shared_prefixes[i].clone() {
+                let (pl, lt) = self.shared_capture_place(*li, &prefix);
+                vals.push((self.read_place(&pl, lt), lt));
+                continue;
+            }
             let lt = self.monomorphize(self.b.locals[*li as usize].ty);
             let pl = self.local_place(*li);
             if self.capture_by_value(ce, i, *li) {
@@ -2430,6 +2443,12 @@ impl<'a> Lcx<'a> {
         let once = self.storage_for_closure(ce).drop_flags;
         for (i, li) in caps.iter().enumerate() {
             let off = ul.fields.get(i).copied().unwrap_or(0) as i32;
+            if let Some(prefix) = self.storage_for_closure(ce).shared_prefixes[i].clone() {
+                let ty = prefix.last().unwrap().1;
+                let addr = self.addr_add(env, off);
+                self.shared_capture_places.push((*li, prefix.iter().map(|p| p.0).collect(), Place::Mem(addr, 0), ty));
+                continue;
+            }
             if once && self.capture_by_value(ce, i, *li) {
                 if let Some(&foff) = ul.fields.get(caps.len() + i) {
                     self.capture_flag.insert(*li, (env, foff as i32));
@@ -7233,6 +7252,11 @@ impl<'a> Lcx<'a> {
                 let mut vals = Vec::new();
                 let _ = is_move;
                 for (i, li) in caps.into_iter().enumerate() {
+                    if let Some(prefix) = self.storage_for_closure(e.0).shared_prefixes[i].clone() {
+                        let (pl, lt) = self.shared_capture_place(li, &prefix);
+                        vals.push((self.read_place(&pl, lt), lt));
+                        continue;
+                    }
                     let lt = self.monomorphize(self.b.locals[li as usize].ty);
                     let pl = self.local_place(li);
                     // by value (a `move` closure, or the body consumes it): moved into the
@@ -7786,6 +7810,13 @@ impl<'a> Lcx<'a> {
     /// field/index. A borrow in a const initializer gives that temporary static
     /// storage too; otherwise a projected borrow escapes the initializer's stack.
     fn lower_place_scoped(&mut self, e: ExprId, static_temps: bool) -> (Place, TyId) {
+        if !self.shared_capture_places.is_empty() {
+            if let Some((root, path)) = self.shared_capture_expr_path(e) {
+                if let Some((_, _, place, ty)) = self.shared_capture_places.iter().find(|(r, p, _, _)| *r == root && *p == path) {
+                    return (place.clone(), *ty);
+                }
+            }
+        }
         if static_temps && !self.is_place_expr(e) {
             if let Some(p) = self.promote_rvalue(e, !self.want_mut) {
                 return (Place::Mem(p, 0), self.body_ty(e));
@@ -9565,12 +9596,63 @@ impl<'a> Lcx<'a> {
         self.read_place(&res, t)
     }
 
-    /// Whether capture `i` (local `li`) of closure `ce` is by value (typeck's decision).
-    /// The fields a precise by-value capture owns (None: the whole local).
+    /// Read the shared-reference prefix while constructing a nested environment.
+    fn shared_capture_place(&mut self, root: u32, prefix: &[(relax_types::expr_use::Projection, TyId)]) -> (Place, TyId) {
+        use relax_types::expr_use::Projection;
+        let found = self.shared_capture_places.iter().find(|(r, path, _, _)| *r == root
+            && path.len() <= prefix.len() && path.iter().zip(prefix).all(|(a, b)| *a == b.0)).cloned();
+        let (mut place, mut ty, skip) = match found {
+            Some((_, path, place, ty)) => (place, ty, path.len()),
+            None => (self.local_place(root), self.monomorphize(self.b.locals[root as usize].ty), 0),
+        };
+        for (projection, next) in &prefix[skip..] {
+            match *projection {
+                Projection::Deref => {
+                    let v = self.read_place(&place, ty);
+                    let regs = self.to_leaves(v, ty);
+                    place = if self.unsized_ty(*next) { Place::Regs(regs) } else { Place::Mem(regs[0], 0) };
+                }
+                Projection::Field(v, f) => place = self.project(&place, ty, v, f).0,
+                _ => unreachable!("shared capture prefix"),
+            }
+            ty = *next;
+        }
+        (place, ty)
+    }
+
+    /// The builtin field/deref path of a place, without evaluating any expression.
+    fn shared_capture_expr_path(&self, e: ExprId) -> Option<(u32, Vec<relax_types::expr_use::Projection>)> {
+        use relax_types::expr_use::Projection;
+        match self.ast().expr(e).kind {
+            ExprKind::Paren(x) => self.shared_capture_expr_path(x),
+            ExprKind::Path(_) => match self.b.res.get(&e.0) {
+                Some(Res::Local(root)) => Some((*root, Vec::new())),
+                _ => None,
+            },
+            ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => {
+                let (root, mut path) = self.shared_capture_expr_path(x)?;
+                let &(derefs, field) = self.b.field_idx.get(&e.0)?;
+                for i in 0..derefs as usize {
+                    if self.b.ov_deref(e.0, i).is_some() { return None; }
+                    path.push(Projection::Deref);
+                }
+                path.push(Projection::Field(0, field));
+                Some((root, path))
+            }
+            ExprKind::Unary(UnOp::Deref, x) if self.b.ov_deref(e.0, 0).is_none() => {
+                let (root, mut path) = self.shared_capture_expr_path(x)?;
+                path.push(Projection::Deref);
+                Some((root, path))
+            }
+            _ => None,
+        }
+    }
+
     fn storage_for_closure(&self, ce: u32) -> &crate::layout::ClosureStorage {
         &self.closure_storage[&ce]
     }
 
+    /// The fields a precise by-value capture owns (None: the whole local).
     fn capture_paths(&self, ce: u32, i: usize) -> Option<Vec<Vec<u32>>> {
         self.storage_for_closure(ce).owned_paths.get(i).cloned().flatten()
     }
