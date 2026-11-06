@@ -1274,6 +1274,16 @@ pub fn find_root(dir: &str) -> Result<String, String> {
 
 /// `find_root` looking no higher than `ceiling` (a mounted repository's root).
 fn find_root_in(dir: &str, ceiling: Option<&str>) -> Result<String, String> {
+    find_root_in_cached(dir, ceiling, &mut WorkspaceRoots::default())
+}
+
+#[derive(Default)]
+struct WorkspaceRoots {
+    declared: HashMap<String, bool>,
+    loaded: HashMap<String, Option<Workspace>>,
+}
+
+fn find_root_in_cached(dir: &str, ceiling: Option<&str>, roots: &mut WorkspaceRoots) -> Result<String, String> {
     let up = |d: &str| if ceiling == Some(d) { None } else { parent(d) };
     let start = normalize(dir);
     let mut cur = Some(start.clone());
@@ -1288,22 +1298,20 @@ fn find_root_in(dir: &str, ceiling: Option<&str>) -> Result<String, String> {
     let current = current.ok_or_else(|| format!("no Cargo.toml in {} or any folder above it", start))?;
     let mut cur = Some(current.clone());
     while let Some(d) = cur {
-        let path = format!("{}/Cargo.toml", d);
-        if crate::vfs::is_file(&path) {
-            if let Ok(t) = read_toml(&path) {
-                if t.contains_key("workspace") {
-                    if d == current {
-                        return Ok(d);
-                    }
-                    if let Ok(ws) = Workspace::load(&d) {
-                        if !ws.excluded(&current) && ws.has_member(&current) {
-                            return Ok(d);
-                        }
-                    }
-                    // a workspace that does not hold this package: keep looking above (cargo
-                    // would refuse; a standalone package is what is meant)
+        let declared = *roots.declared.entry(d.clone()).or_insert_with(|| {
+            read_toml(&format!("{}/Cargo.toml", d)).is_ok_and(|t| t.contains_key("workspace"))
+        });
+        if declared {
+            if d == current {
+                return Ok(d);
+            }
+            if let Some(ws) = roots.loaded.entry(d.clone()).or_insert_with(|| Workspace::load(&d).ok()) {
+                if !ws.excluded(&current) && ws.has_member(&current) {
+                    return Ok(d);
                 }
             }
+            // a workspace that does not hold this package: keep looking above (cargo
+            // would refuse; a standalone package is what is meant)
         }
         cur = up(&d);
     }
@@ -1710,39 +1718,56 @@ impl Units {
 /// license-file, rust-version and readme; the empty string for a field the manifest lacks, as cargo
 /// gives them. Build scripts and crates read them (the `built` crate requires every one).
 pub fn package_meta_env(dir: &str) -> Vec<(String, String)> {
-    const KEYS: [(&str, &str); 8] = [
-        ("CARGO_PKG_AUTHORS", "authors"),
-        ("CARGO_PKG_DESCRIPTION", "description"),
-        ("CARGO_PKG_HOMEPAGE", "homepage"),
-        ("CARGO_PKG_REPOSITORY", "repository"),
-        ("CARGO_PKG_LICENSE", "license"),
-        ("CARGO_PKG_LICENSE_FILE", "license-file"),
-        ("CARGO_PKG_RUST_VERSION", "rust-version"),
-        ("CARGO_PKG_README", "readme"),
-    ];
-    let pkg = read_toml(&format!("{}/Cargo.toml", dir)).ok().and_then(|t| table(&t, "package").cloned()).unwrap_or_default();
-    // the workspace root's [workspace.package], read when a field inherits from it
-    let mut ws: Option<TomlTable> = None;
-    let mut out = Vec::with_capacity(KEYS.len());
-    for (env, key) in KEYS {
-        let mut v = pkg.get(key).cloned();
-        if let Some(Toml::Table(x)) = &v {
-            if b(x, "workspace") == Some(true) {
-                let w = ws.get_or_insert_with(|| {
-                    find_root(dir).ok().and_then(|r| read_toml(&format!("{}/Cargo.toml", r)).ok()).and_then(|t| table(&t, "workspace").and_then(|w| table(w, "package")).cloned()).unwrap_or_default()
-                });
-                v = w.get(key).cloned();
+    PackageMetaEnv::default().get(dir)
+}
+
+/// Workspace metadata reused only within one graph load. A later load starts fresh so source
+/// changes, including edits preserving timestamps, still take effect.
+#[derive(Default)]
+pub struct PackageMetaEnv {
+    roots: WorkspaceRoots,
+    workspace_package: HashMap<String, TomlTable>,
+}
+
+impl PackageMetaEnv {
+    pub fn get(&mut self, dir: &str) -> Vec<(String, String)> {
+        const KEYS: [(&str, &str); 8] = [
+            ("CARGO_PKG_AUTHORS", "authors"),
+            ("CARGO_PKG_DESCRIPTION", "description"),
+            ("CARGO_PKG_HOMEPAGE", "homepage"),
+            ("CARGO_PKG_REPOSITORY", "repository"),
+            ("CARGO_PKG_LICENSE", "license"),
+            ("CARGO_PKG_LICENSE_FILE", "license-file"),
+            ("CARGO_PKG_RUST_VERSION", "rust-version"),
+            ("CARGO_PKG_README", "readme"),
+        ];
+        let pkg = read_toml(&format!("{}/Cargo.toml", dir)).ok().and_then(|t| table(&t, "package").cloned()).unwrap_or_default();
+        // the workspace root's [workspace.package], read when a field inherits from it
+        let mut ws: Option<TomlTable> = None;
+        let mut out = Vec::with_capacity(KEYS.len());
+        for (env, key) in KEYS {
+            let mut v = pkg.get(key).cloned();
+            if let Some(Toml::Table(x)) = &v {
+                if b(x, "workspace") == Some(true) {
+                    let w = ws.get_or_insert_with(|| {
+                        let Some(root) = find_root_in_cached(dir, None, &mut self.roots).ok() else { return TomlTable::default() };
+                        self.workspace_package.entry(root.clone()).or_insert_with(|| {
+                            read_toml(&format!("{}/Cargo.toml", root)).ok().and_then(|t| table(&t, "workspace").and_then(|w| table(w, "package")).cloned()).unwrap_or_default()
+                        }).clone()
+                    });
+                    v = w.get(key).cloned();
+                }
             }
+            let text = match v {
+                Some(Toml::Str(x, _)) => x,
+                Some(Toml::Array(a)) => a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(":"),
+                // `readme = true` / `false`, a number: no text to give
+                _ => String::new(),
+            };
+            out.push((env.to_string(), text));
         }
-        let text = match v {
-            Some(Toml::Str(x, _)) => x,
-            Some(Toml::Array(a)) => a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(":"),
-            // `readme = true` / `false`, a number: no text to give
-            _ => String::new(),
-        };
-        out.push((env.to_string(), text));
+        out
     }
-    out
 }
 
 /// The unit graph of `package` in the workspace at `workspace` (see the module comment).

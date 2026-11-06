@@ -282,8 +282,9 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
 
     let n = crates.len();
     let mut env = Vec::new();
+    let mut metadata = crate::resolve::PackageMetaEnv::default();
     for (dir, name, ver) in &pkg {
-        env.push(pkg_env(dir, name, ver));
+        env.push(pkg_env_with(dir, name, ver, &mut metadata));
     }
     for (ci, c) in crates.iter().enumerate() {
         env[ci].push(("CARGO_CRATE_NAME".to_string(), c.name.clone()));
@@ -348,6 +349,10 @@ pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
 
 /// cargo's per-package compile-time environment (CARGO_MANIFEST_DIR, CARGO_PKG_*).
 fn pkg_env(dir: &str, name: &str, ver: &str) -> Vec<(String, String)> {
+    pkg_env_with(dir, name, ver, &mut crate::resolve::PackageMetaEnv::default())
+}
+
+fn pkg_env_with(dir: &str, name: &str, ver: &str, metadata: &mut crate::resolve::PackageMetaEnv) -> Vec<(String, String)> {
     let mut e = vec![
         ("CARGO_MANIFEST_DIR".to_string(), dir.to_string()),
         ("CARGO_PKG_NAME".to_string(), name.to_string()),
@@ -359,7 +364,7 @@ fn pkg_env(dir: &str, name: &str, ver: &str) -> Vec<(String, String)> {
         e.push((key.to_string(), parts.get(k).unwrap_or(&"0").to_string()));
     }
     e.push(("CARGO_PKG_VERSION_PRE".to_string(), pre.to_string()));
-    e.extend(crate::resolve::package_meta_env(dir));
+    e.extend(metadata.get(dir));
     e
 }
 
