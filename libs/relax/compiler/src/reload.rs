@@ -4406,6 +4406,7 @@ pub fn restart_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_live_stream" => __relax_live_stream as *const () as usize,
         b"__relax_live_log" => __relax_live_log as *const () as usize,
         b"__relax_live_sync" => __relax_live_sync as *const () as usize,
+        b"__relax_test_table" => crate::harness::__relax_test_table as *const () as usize,
         _ => return crate::inspect::engine_req::symbol(name),
     })
 }

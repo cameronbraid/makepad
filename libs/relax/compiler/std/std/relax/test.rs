@@ -217,6 +217,7 @@ impl Out {
 
 extern "C" {
     fn __relax_live_sync(timeout_ms: u64, buf: *mut u8, cap: usize, len: *mut usize) -> u32;
+    fn __relax_test_table() -> *const Tests;
 }
 
 /// The test daemon: the program stays loaded and answers requests on a Unix socket, so a
@@ -274,7 +275,9 @@ fn serve(t: &Tests, path: &str) -> i32 {
                 Ok(mut opts) => {
                     let secs = crate::env::var("RELAX_TEST_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(120u64);
                     opts.timeout = Some(crate::time::Duration::from_secs(secs));
-                    run(t, &opts, &mut out)
+                    // the tests as the program is now: ones a live edit added run too
+                    let current = unsafe { __relax_test_table() };
+                    run(if current.is_null() { t } else { unsafe { &*current } }, &opts, &mut out)
                 }
                 Err(e) => {
                     out.line(&format!("error: {}", e));

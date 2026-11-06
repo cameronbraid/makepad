@@ -39,10 +39,13 @@ struct Found {
 }
 
 /// The `#[test]` fns of `krates` (each crate's root module is not part of the name).
+/// Only the current version of each file counts: a live edit keeps the definitions of the
+/// version it replaced for the frames still running them (`Program::mods` names current files).
 fn collect(prog: &crate::program::Program, krates: &[u32]) -> Vec<Found> {
-    let mut out = Vec::new();
+    let current: std::collections::HashSet<u32> = prog.mods.iter().map(|m| m.file).collect();
+    let mut out: Vec<Found> = Vec::new();
     for (i, d) in prog.defs.iter().enumerate() {
-        if d.kind != DefKind::Fn || !krates.contains(&d.krate) {
+        if d.kind != DefKind::Fn || !krates.contains(&d.krate) || !current.contains(&d.file) {
             continue;
         }
         let f = &prog.files[d.file as usize];
@@ -74,6 +77,8 @@ fn collect(prog: &crate::program::Program, krates: &[u32]) -> Vec<Found> {
         }
         let path = prog.def_path(DefId(i as u32));
         let name = path.split_once("::").map_or(path.clone(), |(_, rest)| rest.to_string());
+        // (a later definition of the same test is a newer version of it)
+        out.retain(|f| f.name != name);
         out.push(Found { def: DefId(i as u32), name, ignore, should_panic, expected });
     }
     out
@@ -104,8 +109,43 @@ pub(crate) fn run(u: &mut Unit, up: *mut Unit, groups: &[(String, u32)]) -> i32 
     code
 }
 
+/// The crate whose tests the running harness serves (`__relax_test_table`); u32::MAX: none.
+static HARNESS_KRATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
 fn run_crate(u: &mut Unit, up: *mut Unit, krate: u32) -> Result<i32, String> {
-    let found = collect(&u.prog, &[krate]);
+    HARNESS_KRATE.store(krate, std::sync::atomic::Ordering::Release);
+    let (tests, main_entry) = table(u, krate)?;
+    let tests: *mut Tests = tests;
+    match unsafe { jit::call_jit(up, main_entry as u64, tests as u64) } {
+        Ok(_) => Ok(unsafe { std::ptr::read_volatile(&(*tests).code) }),
+        Err(p) => Err(format!("the test harness {}: {}", p.kind, p.message)),
+    }
+}
+
+/// The test table of the running harness's crate as the program is now: tests a live edit added
+/// are in it, removed ones are not (a test daemon asks for it per request, std::relax::test).
+/// Null outside a harness run or when the table cannot be made (the error is printed).
+pub extern "C" fn __relax_test_table() -> *mut std::ffi::c_void {
+    jit::host_boundary("__relax_test_table", move || {
+        let krate = HARNESS_KRATE.load(std::sync::atomic::Ordering::Acquire);
+        let up = jit::cur_unit();
+        if krate == u32::MAX || up.is_null() {
+            return std::ptr::null_mut();
+        }
+        match table(unsafe { &mut *up }, krate) {
+            Ok((tests, _)) => (tests as *mut Tests).cast(),
+            Err(e) => {
+                eprintln!("makepad test: the test table: {e}");
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// The crate's test table (kept for the process: the harness's threads read it) and the entry
+/// of the harness's main.
+fn table(u: &mut Unit, krate: u32) -> Result<(&'static mut Tests, usize), String> {
+    let found = crate::owner::call(crate::owner::Class::Program, || collect(&u.prog, &[krate]));
     let main = find_fn(u, "std::relax::test::main").ok_or("std has no relax::test::main (the test harness)")?;
     let start = find_fn(u, "std::relax::test::__relax_test_start");
     let (addrs, main_entry) = crate::owner::call(crate::owner::Class::Program, || -> Result<_, String> {
@@ -155,9 +195,5 @@ fn run_crate(u: &mut Unit, up: *mut Unit, krate: u32) -> Result<i32, String> {
         let table: &'static [Test] = Box::leak(table.into_boxed_slice());
         Box::leak(Box::new(Tests { tests: table.as_ptr(), len: table.len(), code: 101 }))
     });
-    let tests: *mut Tests = tests;
-    match unsafe { jit::call_jit(up, main_entry, tests as u64) } {
-        Ok(_) => Ok(unsafe { std::ptr::read_volatile(&(*tests).code) }),
-        Err(p) => Err(format!("the test harness {}: {}", p.kind, p.message)),
-    }
+    Ok((tests, main_entry as usize))
 }
