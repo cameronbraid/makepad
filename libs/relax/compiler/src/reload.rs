@@ -659,11 +659,33 @@ fn toks<'a>(pf: &'a crate::parser::ParsedFile, lo: u32, hi: u32, holes: &[(u32, 
     let i0 = first_tok_at(&pf.toks, lo);
     let mut covered = false;
     let mut prev_hi = lo;
+    // an item in expansion text (derive output past the file's own) can span a token of the next
+    // expansion after its closing `}` or `;`: the item ends there
+    let expanded = lo >= pf.src_len;
+    let mut depth = 0i32;
     for t in pf.toks.iter_from(i0) {
         if t.hi > hi {
             break;
         }
         covered = true;
+        if expanded && !holes.iter().any(|&(a, b)| t.lo >= a && t.hi <= b) {
+            match pf.src.get(t.lo as usize..t.hi as usize) {
+                Some(b"{" | b"(" | b"[") => depth += 1,
+                Some(b")" | b"]") => depth -= 1,
+                Some(b"}") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        out.push(&pf.src[t.lo as usize..t.hi as usize]);
+                        break;
+                    }
+                }
+                Some(b";") if depth == 0 => {
+                    out.push(&pf.src[t.lo as usize..t.hi as usize]);
+                    break;
+                }
+                _ => {}
+            }
+        }
         // a `>>` / `>=` / `>>=` (`<<`, `<=`) the parser split keeps its second part as the
         // token (its first char consumed): read the token with that char, as a version that
         // holds the same text untokenized reads it (an expansion's `Option<X<'a>>` compared
@@ -1004,7 +1026,11 @@ pub(crate) fn pair_items(old: &crate::parser::ParsedFile, new: &crate::parser::P
             None => removed.push(i as u32),
         }
     }
-    let added = (0..kn.len() as u32).filter(|j| !used[*j as usize]).collect();
+    let added: Vec<u32> = (0..kn.len() as u32).filter(|j| !used[*j as usize]).collect();
+    if std::env::var_os("MAKEPAD_RUN_LIVE_KEYS").is_some() {
+        for &i in &removed { eprintln!("makepad live keys: removed [{}..{}] {}", old.ast.items[i as usize].lo, old.ast.items[i as usize].hi, ko[i as usize]); }
+        for &j in &added { eprintln!("makepad live keys: added [{}..{}] {}", new.ast.items[j as usize].lo, new.ast.items[j as usize].hi, kn[j as usize]); }
+    }
     (pairs, removed, added)
 }
 
@@ -1108,7 +1134,10 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
     // an item in a body (`use` in a fn or closure body, a nested fn): part of the edit of the
     // paired item whose body holds it -- its body is checked again, and its blocks' items get
     // their scopes when the version is committed (Program::collect_new_body_blocks)
+    // (an item a macro expanded inside a body is at its call site: the expansion text lies past
+    // the file's own)
     let in_paired_body = |pf: &crate::parser::ParsedFile, side_new: bool, at: u32| -> bool {
+        let at = pf.call_site(at);
         pairs.iter().any(|&(i, j)| {
             let k = if side_new { j } else { i };
             let it = &pf.ast.items[k as usize];
