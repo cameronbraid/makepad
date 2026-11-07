@@ -1353,6 +1353,20 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
         }
     }
     if why.is_empty() {
+        if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
+            for c in &out {
+                let (kind, d) = match c { Change::Body(d) => ("body", Some(*d)), Change::Const(d) => ("const", Some(*d)), Change::StaticInit(d) => ("static", Some(*d)), Change::Layout(d) => ("layout", Some(*d)), Change::Macro(_) => ("macro", None) };
+                eprintln!("reload-trace: change {} {} slots={}", kind, d.map_or(String::new(), |d| prog.def_path(d)), d.map_or(0, |d| prog.item_defs.iter().filter(|(_, v)| **v == d).count()));
+            }
+            for &(i, j) in &pairs {
+                let (a, b) = (&oa.items[i as usize], &na.items[j as usize]);
+                if b.lo >= new.src_len || a.lo >= old.src_len {
+                    let def = prog.item_defs.get(&(old_file, i)).map(|d| prog.def_path(*d));
+                    let same = same_toks(old, a.lo, a.hi, &[], new, b.lo, b.hi, &[]);
+                    if !same { eprintln!("reload-trace: expansion item old#{i} new#{j} def={def:?} differs"); }
+                }
+            }
+        }
         Ok(Plan { pairs, changes: out, added: plan_added, removed: plan_removed, removed_uses, attributes_changed })
     } else {
         if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {

@@ -396,8 +396,9 @@ impl Layouts {
         let TyKind::FnDef(def, args, _) = tcx.tys.kind(*owner) else { panic!("closure owner") };
         let body = crate::typeck::codegen_body(prog, tcx, *def, tcx.tys.list(*args));
         if body.file != *file {
-            panic!("the environment of a closure of a replaced version of {} (expression {}) is unknown: no body of that version was lowered in this process",
-                prog.file_paths.get(*file as usize).map_or("?", |p| p.as_str()), ce & !crate::tcx::ASYNC_FN_BODY);
+            panic!("the environment of a closure of a replaced version of {} (expression {}{}, owner {}) is unknown: no body of that version was lowered in this process",
+                prog.file_paths.get(*file as usize).map_or("?", |p| p.as_str()), ce & !crate::tcx::ASYNC_FN_BODY,
+                if ce & crate::tcx::ASYNC_FN_BODY != 0 { ", an async fn body" } else { "" }, prog.def_path(*def));
         }
         let storage = ClosureStorage::for_codegen(prog, tcx, &body, *ce);
         self.closure_storage.insert(ty, storage.clone());
