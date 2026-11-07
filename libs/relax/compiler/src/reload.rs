@@ -1145,10 +1145,18 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
             matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::Static(..)) && it.lo < at && at < it.hi
         })
     };
+    // (an item in the body of an added or removed fn goes with it, as in a paired one)
+    let in_listed_body = |pf: &crate::parser::ParsedFile, listed: &[u32], reached: &[bool], at: u32| -> bool {
+        let at = pf.call_site(at);
+        listed.iter().any(|&k| {
+            let it = &pf.ast.items[k as usize];
+            reached[k as usize] && matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::Static(..)) && it.lo < at && at < it.hi
+        })
+    };
     for &j in &added {
         let it = &na.items[j as usize];
         let name = String::from_utf8_lossy(&new.src[it.name.lo as usize..it.name.hi as usize]).into_owned();
-        if !nreached[j as usize] && in_paired_body(new, true, it.lo) {
+        if !nreached[j as usize] && (in_paired_body(new, true, it.lo) || in_listed_body(new, &added, &nreached, it.lo)) {
             continue;
         }
         // inside an added container: collected with it
@@ -1183,7 +1191,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
     for &i in &removed {
         let it = &oa.items[i as usize];
         let name = String::from_utf8_lossy(&old.src[it.name.lo as usize..it.name.hi as usize]).into_owned();
-        if !oreached[i as usize] && in_paired_body(old, false, it.lo) {
+        if !oreached[i as usize] && (in_paired_body(old, false, it.lo) || in_listed_body(old, &removed, &oreached, it.lo)) {
             continue;
         }
         if let Some(p) = op[i as usize] {
@@ -1222,7 +1230,20 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
     for &(i, j) in &pairs {
         let (a, b) = (&oa.items[i as usize], &na.items[j as usize]);
         let name = String::from_utf8_lossy(&new.src[b.name.lo as usize..b.name.hi as usize]).into_owned();
-        let holes = |pf: &crate::parser::ParsedFile, k: &ItemKind| -> Vec<(u32, u32)> { child_items(&pf.ast, k).iter().map(|c| (pf.ast.items[c.0 as usize].lo, pf.ast.items[c.0 as usize].hi)).collect() };
+        // (a child's attributes precede its span, from their `#[`: an added `#[test] fn` leaves
+        // its container alike)
+        let holes = |pf: &crate::parser::ParsedFile, k: &ItemKind| -> Vec<(u32, u32)> {
+            let text = |i: usize| pf.toks.get(i).and_then(|x| pf.src.get(x.lo as usize..x.hi as usize));
+            child_items(&pf.ast, k).iter().map(|c| {
+                let it = &pf.ast.items[c.0 as usize];
+                let lo = pf.ast.list(it.attrs).iter().filter_map(|t| {
+                    let i = t.toks.lo as usize;
+                    let i = if i >= 2 && text(i - 1) == Some(b"[") && text(i - 2) == Some(b"#") { i - 2 } else { i };
+                    pf.toks.get(i).map(|x| x.lo)
+                }).fold(it.lo, u32::min);
+                (lo, it.hi)
+            }).collect()
+        };
         let ha = holes(old, &a.kind);
         let hb = holes(new, &b.kind);
         // attributes are part of the item (cfg, derive, repr, inline)
@@ -1322,7 +1343,13 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                 Some(d) => out.push(Change::Layout(d)),
                 None => why.push(format!("{}: struct `{}` has no definition -- restart the app", pos(new, b.lo), name)),
             },
-            (_, k) => why.push(format!("{}: {} `{}` changed: {} -- restart the app", pos(new, b.lo), kind_name(k), name, restart_reason(k))),
+            (_, k) => {
+                if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
+                    let sh = |v: Vec<Vec<u8>>| v.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join(" ");
+                    eprintln!("reload: `{}` outside its items:\n  old: {}\n  new: {}", name, sh(toks_norm(old, la, a.hi, &ha)), sh(toks_norm(new, lb, b.hi, &hb)));
+                }
+                why.push(format!("{}: {} `{}` changed: {} -- restart the app", pos(new, b.lo), kind_name(k), name, restart_reason(k)))
+            }
         }
     }
     if why.is_empty() {
