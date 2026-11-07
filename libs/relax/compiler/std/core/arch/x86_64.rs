@@ -1334,6 +1334,19 @@ pub unsafe fn _mm_maddubs_epi16(a: __m128i, b: __m128i) -> __m128i {
     vx::vx_binary(a, b, 27, 8)
 }
 
+// (no backend op: lane by lane, rounding as pmulhrsw does)
+#[inline(always)]
+pub unsafe fn _mm_mulhrs_epi16(a: __m128i, b: __m128i) -> __m128i {
+    let (a, b) = (crate::mem::transmute::<__m128i, [i16; 8]>(a), crate::mem::transmute::<__m128i, [i16; 8]>(b));
+    let mut r = [0i16; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = (((((a[i] as i32) * (b[i] as i32)) >> 14) + 1) >> 1) as i16;
+        i += 1;
+    }
+    crate::mem::transmute::<[i16; 8], __m128i>(r)
+}
+
 #[inline(always)]
 pub unsafe fn _mm_min_epi16(a: __m128i, b: __m128i) -> __m128i {
     vx::vx_binary(a, b, 12, 16)
@@ -1618,6 +1631,11 @@ pub unsafe fn _mm_div_ps(a: __m128, b: __m128) -> __m128 {
 }
 
 pub unsafe fn _mm_loadl_epi64(mem_addr: *const __m128i) -> __m128i {
+    __m128i([crate::ptr::read_unaligned(mem_addr as *const i64), 0])
+}
+
+#[inline(always)]
+pub unsafe fn _mm_loadu_si64(mem_addr: *const u8) -> __m128i {
     __m128i([crate::ptr::read_unaligned(mem_addr as *const i64), 0])
 }
 
@@ -3248,6 +3266,7 @@ pub unsafe fn _mm_packus_epi32(a: __m128i, b: __m128i) -> __m128i {
     vx::vx_binary(a, b, 22, 32)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn _mm_srai_epi16<const IMM8: i32>(a: __m128i) -> __m128i {
     vx::vx_unary(a, 3, 16, IMM8)
@@ -3259,6 +3278,7 @@ pub unsafe fn _mm_cmpneq_ps(a: __m128, b: __m128) -> __m128 {
 }
 
 // SSE has no arithmetic qword shift; the backend synthesizes its sign extension.
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn _mm_srai_epi64<const IMM8: i32>(a: __m128i) -> __m128i {
     vx::vx_unary(a, 3, 64, IMM8)

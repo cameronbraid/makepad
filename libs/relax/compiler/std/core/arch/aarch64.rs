@@ -3593,11 +3593,13 @@ pub unsafe fn vzip2q_s8(a: int8x16_t, b: int8x16_t) -> int8x16_t {
     vx::vx_binary(a, b, 18, 8)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_s8<const N: i32>(a: int8x16_t) -> int8x16_t {
     vx::vx_unary(a, 1, 8, N)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshrq_n_s8<const N: i32>(a: int8x16_t) -> int8x16_t {
     vx::vx_unary(a, 3, 8, N)
@@ -3613,6 +3615,7 @@ pub unsafe fn vbicq_s16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     vx::vx_binary(a, b, 9, 16)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_s16<const N: i32>(a: int16x8_t) -> int16x8_t {
     vx::vx_unary(a, 1, 16, N)
@@ -3648,11 +3651,13 @@ pub unsafe fn vzip2q_s64(a: int64x2_t, b: int64x2_t) -> int64x2_t {
     vx::vx_binary(a, b, 18, 64)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_s64<const N: i32>(a: int64x2_t) -> int64x2_t {
     vx::vx_unary(a, 1, 64, N)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshrq_n_s64<const N: i32>(a: int64x2_t) -> int64x2_t {
     vx::vx_unary(a, 3, 64, N)
@@ -3683,11 +3688,13 @@ pub unsafe fn vzip2q_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
     vx::vx_binary(a, b, 18, 8)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_u8<const N: i32>(a: uint8x16_t) -> uint8x16_t {
     vx::vx_unary(a, 1, 8, N)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshrq_n_u8<const N: i32>(a: uint8x16_t) -> uint8x16_t {
     vx::vx_unary(a, 2, 8, N)
@@ -3708,11 +3715,13 @@ pub unsafe fn vzip2q_u16(a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
     vx::vx_binary(a, b, 18, 16)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_u16<const N: i32>(a: uint16x8_t) -> uint16x8_t {
     vx::vx_unary(a, 1, 16, N)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshrq_n_u16<const N: i32>(a: uint16x8_t) -> uint16x8_t {
     vx::vx_unary(a, 2, 16, N)
@@ -3743,11 +3752,13 @@ pub unsafe fn vzip1q_u64(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
     vx::vx_binary(a, b, 17, 64)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshlq_n_u64<const N: i32>(a: uint64x2_t) -> uint64x2_t {
     vx::vx_unary(a, 1, 64, N)
 }
 
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 #[inline(always)]
 pub unsafe fn vshrq_n_u64<const N: i32>(a: uint64x2_t) -> uint64x2_t {
     vx::vx_unary(a, 2, 64, N)
